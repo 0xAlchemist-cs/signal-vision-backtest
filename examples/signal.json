@@ -1,0 +1,16 @@
+{
+  "id": "example-001",
+  "ts_ms": 1735580420000,
+  "text": "$SAND Going short here at cmp. tp 1135 area (close half), stop to BE, rest moon. add 980, hard stop 945",
+  "symbol": "SAND",
+  "side": "SHORT",
+  "order_type": "MARKET",
+  "entry_price": 1038.0,
+  "entry_prices": [],
+  "sl": 945.0,
+  "sl_source": "text",
+  "stop_trigger_type": null,
+  "stop_timeframe": null,
+  "conditional": false,
+  "tp_levels": [1135.0]
+}

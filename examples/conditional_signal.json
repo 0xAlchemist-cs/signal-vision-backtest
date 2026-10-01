@@ -1,0 +1,16 @@
+{
+  "id": "example-002",
+  "ts_ms": 1735581000000,
+  "text": "4H close under 1865 and we go short. stops 1892, tp 1820 and below. wait for the right side.",
+  "symbol": "ETH",
+  "side": "SHORT",
+  "order_type": null,
+  "entry_price": null,
+  "entry_prices": [1865.0],
+  "sl": 1892.0,
+  "sl_source": "text",
+  "stop_trigger_type": null,
+  "stop_timeframe": null,
+  "conditional": true,
+  "tp_levels": [1820.0]
+}
