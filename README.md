@@ -46,6 +46,75 @@
 - 标准化的"早落袋 + 保本"纪律把进场优势兑现成曲线，而照抄指令把同一优势浪费在够不到的远端止盈上；
 - 交易员后续的**喊单**（移损/部分止盈/全平）在两种规则下都作为离场事件保留。
 
+## 三、系统架构
+
+### 3.1 数据流总览
+
+```mermaid
+flowchart LR
+    subgraph COLLECT["① 数据采集 fetch/"]
+        A1["discord_history.py<br/>频道全量消息分页抓取<br/>(JSONL: 文字+图URL)"]
+        A2["chart_images.py<br/>图表截图批量下载<br/>(压缩/重命名/断点续传)"]
+    end
+
+    subgraph PARSE["② 信号解析 signal_parser/"]
+        B1["本地预筛<br/>动作词+价格正则<br/>(纯聊天零API)"]
+        B2["视觉 LLM 直解<br/>(文字+图一并输入)"]
+        B3["结构化 JSON<br/>entry/sl/tp/conditional/<br/>close_based/intent_family"]
+    end
+
+    subgraph SIM["③ 回测引擎 backtest/engine.py"]
+        C1["Market 行情层<br/>Bybit主源+Binance兜底<br/>1m K线4线程并行预取<br/>bisect切片/磁盘缓存"]
+        C2["Sim 撮合层<br/>事件驱动·毫秒插入<br/>四tick保守重放"]
+        C3["出场规则<br/>r_ladder / tp_ladder<br/>喊单+close_based止损"]
+    end
+
+    subgraph OUT["④ 产出 reports/"]
+        D1["逐单明细<br/>(每笔的完整出场链)"]
+        D2["ΣR/胜率/回撤<br/>敏感性矩阵"]
+    end
+
+    A1 --> A2
+    A2 --> B1
+    B1 --> B2
+    B2 --> B3
+    B3 --> C2
+    C1 --> C2
+    C2 --> C3
+    C3 --> D1
+    D1 --> D2
+```
+
+### 3.2 撮合时间轴（1 分钟 K 线 → 4 tick）
+
+```mermaid
+flowchart LR
+    subgraph M["一根 1m K 线 (阳线示例: O→L→H→C)"]
+        direction LR
+        T0["0s<br/>O 开盘"] --> T1["20s<br/>L 逆行极值<br/>(先试探不利方向)"]
+        T1 --> T2["40s<br/>H 顺行极值"]
+        T2 --> T3["60s<br/>C 收盘<br/>(close_based止损<br/>在此判定)"]
+    end
+    MSG["📩 交易员消息<br/>ts = 第 31.4s"] -.->|"插入 tick 之间<br/>成交=消息后首个 tick (40s 槽位)"| T2
+```
+
+- 阳线走 `O→L→H→C`、阴线走 `O→H→L→C`——同根 K 线内**先试探对持仓不利的方向**，
+  避免"TP/SL 同根 K 线永远先成 TP"的乐观偏差（保守重放设计致敬
+  [VeloTradeX](https://github.com/VeloTradeX/velotradex)，MIT）；
+- 交易员的后续喊单（移损/分批止盈/全平）与资金费时点同样按毫秒插入，
+  作用于当时仍持有的仓位。
+
+### 3.3 组件说明
+
+| 组件 | 文件 | 职责 | 关键设计 |
+|---|---|---|---|
+| 频道抓取 | `fetch/discord_history.py` | 分页拉取频道全量消息 → JSONL | 域名白名单 + 解析 IP 私网拦截 + 禁重定向 + 429 退避 |
+| 图表下载 | `fetch/chart_images.py` | 附件图批量下载压缩（≤1280px） | CDN 白名单；签名 URL 过期前及时抓取 |
+| 信号解析 | `signal_parser/parser.py` | 文字+图 → 结构化 JSON | 本地预筛省 API；文字数字优先、图只补缺纠错；四族分类过滤战报/教学帖 |
+| 行情层 `Market` | `backtest/engine.py` | 合约解析 + 1m K 线缓存 + tick 展开 | Bybit 主源 Binance 兜底；4 线程并行预取 + 条件变量等待；缺口分段补拉；非活跃标的内存驱逐 |
+| 撮合层 `Sim` | `backtest/engine.py` | 事件驱动持仓管理 | R 阶梯/TP 阶梯双规则；喊单三类动作（止盈/移损/全平）秒级生效；资金费逐期计入；30 天持仓上限 |
+| 报告 | `backtest/engine.py` | 逐单明细 + ΣR/胜率/回撤 | 出场链完整可溯（每笔含 1R/2R/喊单/止损的精确时点） |
+
 ## 四、快速开始
 
 ```bash
