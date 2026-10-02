@@ -720,7 +720,10 @@ class Sim:
             pos["remain_total"] = 0.0
             pos["force_closed"] = True
         elif action in ("MOVE_BE", "stop_be", "stop_move"):
-            new_stop = params.get("stop_price") or params.get("new_stop")
+            # 生产 parse_ov_manage 产出 new_sl; 兼容旧字段 stop_price/new_stop。
+            # 缺这个键时显式移损价会被静默退化成保本价(实测 13/30 条受影响)
+            new_stop = (params.get("stop_price") or params.get("new_stop")
+                        or params.get("new_sl"))
             mult = pos["mult"]
             ns = float(new_stop) * mult if new_stop else pos["legs"][0]["entry"]
             eff = ns * ((1 - SLIP) if is_long else (1 + SLIP))

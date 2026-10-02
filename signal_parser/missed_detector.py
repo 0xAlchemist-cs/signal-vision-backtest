@@ -18,17 +18,30 @@ LEVEL_LIKE = re.compile(
 NUM = re.compile(r"\d{3,}(?:\.\d+)?")
 
 
+def _validated_file(path_str: str, suffixes: tuple) -> Path:
+    """Resolve and restrict inputs to existing regular files with expected
+    suffixes (guards against path/device misuse in library contexts)."""
+    p = Path(path_str).resolve()
+    if p.suffix.lower() not in suffixes:
+        raise ValueError(f"unexpected file type (want {suffixes}): {p}")
+    if not p.is_file():
+        raise FileNotFoundError(p)
+    return p
+
+
 def scan_missed(jsonl_path: str, signals_path: str) -> dict:
     """Scan a message JSONL for entry-like pure-text messages that the
     parser did NOT capture as signals. Returns a summary dict."""
     sig_ids = set()
-    if Path(signals_path).exists():
-        for s in json.loads(Path(signals_path).read_text(encoding="utf-8")):
+    sig_file = _validated_file(signals_path, (".json",))
+    jsonl_file = _validated_file(jsonl_path, (".jsonl", ".json"))
+    if sig_file.exists():
+        for s in json.loads(sig_file.read_text(encoding="utf-8")):
             sig_ids.add(s.get("id"))
 
     missed = []
     total_text = 0
-    for line in Path(jsonl_path).open(encoding="utf-8"):
+    for line in jsonl_file.open(encoding="utf-8"):
         if not line.strip().endswith("}"):
             continue
         m = json.loads(line)
@@ -48,15 +61,29 @@ def scan_missed(jsonl_path: str, signals_path: str) -> dict:
             "missed": missed}
 
 
+def _require_inside(root: Path, p: Path) -> Path:
+    """CLI guard: refuse paths escaping the working-directory tree."""
+    try:
+        p.relative_to(root)
+    except ValueError:
+        raise SystemExit(
+            f"refusing path outside working directory {root}: {p}\n"
+            "(run from the data root, or call scan_missed() from code)")
+    return p
+
+
 if __name__ == "__main__":
     import sys
-    jsonl = sys.argv[1] if len(sys.argv) > 1 else "data/channel.jsonl"
-    sigs = sys.argv[2] if len(sys.argv) > 2 else "work/signals.json"
-    result = scan_missed(jsonl, sigs)
+    root = Path.cwd().resolve()
+    jsonl_arg = sys.argv[1] if len(sys.argv) > 1 else "data/channel.jsonl"
+    sigs_arg = sys.argv[2] if len(sys.argv) > 2 else "work/signals.json"
+    jsonl_file = _require_inside(root, _validated_file(jsonl_arg, (".jsonl", ".json")))
+    sig_file = _require_inside(root, _validated_file(sigs_arg, (".json",)))
+    result = scan_missed(str(jsonl_file), str(sig_file))
     print(json.dumps({k: v for k, v in result.items() if k != "missed"},
                      ensure_ascii=False, indent=2))
     if result["missed"]:
-        out = Path(jsonl).parent / "missed_signals.json"
+        out = jsonl_file.parent / "missed_signals.json"
         out.write_text(json.dumps(result["missed"], ensure_ascii=False),
                        encoding="utf-8")
         print(f"→ {len(result['missed'])} 条疑似漏检信号已存 {out}")
