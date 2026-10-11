@@ -154,20 +154,18 @@ def test_gap_fill_uses_tick_price(engine_mod):
 
 
 def test_stop_entry_semantics(engine_mod):
-    """STOP 入场触发方向与限价相反: SHORT-STOP 向下突破触发"""
-    from types import MethodType
-    sim = engine_mod.Sim(rule="tp_ladder")
-    # 不跑完整 Market; 只验证触发方向判定逻辑通过独立小函数不可行(内联),
-    # 退而在纯数据上断言: SHORT-STOP entry=90, price=89 → 触发;
-    # 对应 LIMIT-SHORT 同参数 price=89 不触发(price<=entry 是 LIMIT-SHORT 触发, 语义不同)
-    is_long = False
-    ot_stop, ot_limit = "STOP", "LIMIT"
-    ep = 90.0
-    price = 89.0
-    # STOP-SHORT: price <= ep 触发(向下跌破)
-    assert price <= ep
+    """STOP 入场触发方向与限价相反: SHORT-STOP 向下突破触发。
+    纯语义断言 — 不实例化 Sim(其 __init__ 会拉交易所元数据, CI 网络不可达)。"""
+    # 引擎成交查找循环里的方向谓词(与 _handle_open 一致):
+    # LONG: price >= ep 触发; SHORT: price <= ep 触发(STOP)
     # LIMIT-SHORT: price >= ep 才触发(挂上方等回触) — price=89 < 90 不触发
-    assert not (price >= ep)
+    ep, price = 90.0, 89.0
+    short_stop_hit = price <= ep          # "4H 收盘跌破 90 才空" → 向下跌破触发
+    short_limit_hit = price >= ep         # 挂 90 等回触 → 未触及
+    assert short_stop_hit and not short_limit_hit
+    # 反向: LONG-STOP 向上突破触发
+    price2 = 91.0
+    assert price2 >= ep and not (price2 <= ep)
 
 
 def test_move_be_uses_weighted_avg_not_first_leg(engine_mod):
