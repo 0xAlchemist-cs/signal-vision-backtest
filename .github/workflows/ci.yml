@@ -15,9 +15,16 @@ jobs:
           python-version: "3.11"
       - name: Install test deps
         run: pip install pytest pillow
+      - name: Env info
+        run: python --version && pip list
+      - name: Syntax checks
+        run: |
+          python -c "import ast; [ast.parse(open(f, encoding='utf-8').read()) for f in ('backtest/engine.py', 'backtest/voice_event_engine.py', 'signal_parser/parser.py')]; print('syntax OK')"
+      - name: Collect tests
+        run: python -m pytest tests/ --collect-only -q
       - name: Run regression tests
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v --tb=long
       - name: Import smoke checks
+        if: always()
         run: |
           python -c "import importlib.util as iu; s=iu.spec_from_file_location('e','backtest/voice_event_engine.py'); m=iu.module_from_spec(s); s.loader.exec_module(m); print('voice_event_engine OK')"
-          python -c "import ast; ast.parse(open('backtest/engine.py', encoding='utf-8').read()); print('engine.py syntax OK')"
