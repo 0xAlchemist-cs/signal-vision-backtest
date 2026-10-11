@@ -271,3 +271,35 @@ def test_parser_does_not_touch_entry_type_from_stop():
         "归一化段中不得出现 order_type→STOP 的改写(旧映射已删除)"
     assert "entry_trigger_type" in src, \
         "条件入场的触发语义应由独立的 entry_trigger_type 字段承载"
+
+
+def test_advance_all_conflict_stats_no_nameerror(engine_mod):
+    """第三轮 P0 回归: _advance_all 的 TP/SL 冲突统计不得引用未定义变量
+    (曾因 is_long 未定义抛 NameError), 且 _tp_hit_ms 每 bar 必清理。"""
+    sim = engine_mod.Sim.__new__(engine_mod.Sim)
+    sim.trades = []          # _finish 需要
+    bars = []
+    t0 = 60_000
+    for n in range(6):
+        t = t0 + n * 60_000
+        # bar2/high=106 触发 TP105 且 low=96 覆盖 SL97 → 同 bar 冲突
+        bars.append([t, 100.0, 106.0, 96.0, 105.5] if n == 2
+                    else [t, 100.0, 100.5, 99.5, 100.0])
+    sim.mkt = FakeMarket(bars)
+    pos = {"symbol": "TESTUSDT", "source": "fake", "base": "TEST",
+           "side": "LONG", "rule": "tp_ladder", "mult": 1.0,
+           "signal_ts_ms": t0, "first_fill_ms": t0, "walked_ms": t0,
+           "stop_init": 97.0, "status": None, "msg_id": "x", "text": "",
+           "mg_by_sym": {}, "sl_source": "text", "funding_usdt": 0.0,
+           "fev": [], "fev_i": 0, "force_closed": False,
+           "tp_sl_conflicts": 0,
+           "legs": [{"entry": 100.0, "risk_unit": 3.0, "risk_share": 1.0,
+                     "remain_frac": 1.0, "stop": 97.0, "t1_done": True,
+                     "t2_done": True, "fill_ms": t0, "exits": []}],
+           "remain_total": 1.0, "tp_ladder": [
+               {"i": 1, "price": 105.0, "frac": 1.0, "done": False}],
+           "stop_close_based": False, "stop_tf_min": 1}
+    positions = {"TEST": pos}
+    sim._advance_all(positions, t0 + 6 * 60_000)   # 不抛 NameError 即通过
+    assert pos.get("tp_sl_conflicts") == 1, "bar2 应计一次 TP/SL 同 bar 冲突"
+    assert pos.get("_tp_hit_ms") is None, "_tp_hit_ms 必须每 bar 清理"

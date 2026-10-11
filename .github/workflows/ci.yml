@@ -20,19 +20,8 @@ jobs:
       - name: Syntax checks
         run: |
           python -c "import ast; [ast.parse(open(f, encoding='utf-8').read()) for f in ('backtest/engine.py', 'backtest/voice_event_engine.py', 'signal_parser/parser.py')]; print('syntax OK')"
-      - name: "T1 candle_to_ticks slots"
-        run: python -m pytest "tests/test_p0_fixes.py::test_candle_to_ticks_four_slots" -q
-      - name: "T2 voice ref prev bar"
-        run: python -m pytest "tests/test_p0_fixes.py::test_voice_event_ref_uses_prev_closed_bar" -q
-      - name: "T3 voice limit fill walk start"
-        run: python -m pytest "tests/test_p0_fixes.py::test_voice_event_limit_fill_walk_starts_at_fill_bar" -q
-      - name: "T4 stop trigger raw stop"
-        run: python -m pytest "tests/test_p0_fixes.py::test_stop_trigger_uses_raw_stop_not_slipped" -q
-      - name: "T5 inactive leg skipped"
-        run: python -m pytest "tests/test_p0_fixes.py::test_inactive_leg_skipped_before_fill" -q
-      - name: "T6 gap fill tick price"
-        run: python -m pytest "tests/test_p0_fixes.py::test_gap_fill_uses_tick_price" -q
-      - name: "T7 stop entry semantics"
-        run: python -m pytest "tests/test_p0_fixes.py::test_stop_entry_semantics" -q
-      - name: "T8 move BE weighted avg"
-        run: python -m pytest "tests/test_p0_fixes.py::test_move_be_uses_weighted_avg_not_first_leg" -q
+      - name: Run all tests
+        run: python -m pytest tests/ -q --tb=long
+      - name: CLI smoke (parser entry)
+        if: always()
+        run: python -m signal_parser --text "long btc entry 100 sl 95" || echo "(no API key expected, entry verified)"

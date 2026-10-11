@@ -1,0 +1,10 @@
+requests
+
+[dev]
+pytest
+
+[fetch]
+pillow
+
+[vision]
+requests
