@@ -630,6 +630,12 @@ class Sim:
                         continue
                     # 消息在上一 tick 与本 tick 之间 → 本 tick 价成交
                     while pi < len(pend) and pend[pi]["ts_ms"] <= tms:
+                        # 生命周期守卫 (审查八): 早于本 setup 开仓信号的管理消息
+                        # 属于前一持仓的生命周期, 对本仓**失效** — 消费但不执行
+                        # (否则旧仓止损后的 CLOSE_ALL 会误杀同标的下一笔新仓)
+                        if pend[pi]["ts_ms"] < pos.get("signal_ts_ms", 0):
+                            pi += 1
+                            continue
                         self._apply_manage(pos, pend[pi], price)
                         pi += 1
                         if pos.get("force_closed"):
@@ -698,17 +704,24 @@ class Sim:
                 if tp["done"]:
                     continue
                 if (is_long and price >= tp["price"]) or (not is_long and price <= tp["price"]):
-                    tp["done"] = True
-                    pos["_tp_hit_ms"] = tms
                     fill = tp["price"] * (1 - SLIP) if is_long else tp["price"] * (1 + SLIP)
+                    took = 0.0
                     for leg in pos["legs"]:
                         # 未激活腿(限价尚未成交)不参与止盈
                         if leg["remain_frac"] <= 1e-9 or tms < leg.get("fill_ms", 0):
                             continue
                         take = min(tp["frac"], leg["remain_frac"])
+                        if take <= 1e-9:
+                            continue
                         leg["exits"].append({"price": fill, "frac": take, "ts_ms": tms,
                                              "reason": f"TP{tp['i']}@{tp['price']:g}"})
                         leg["remain_frac"] -= take
+                        took += take
+                    # 至少一条有效腿完成**非零**止盈才标记 done (审查八):
+                    # 无持仓可平时空触及不得消耗该档 — 否则迟到腿永久失去止盈
+                    if took > 1e-9:
+                        tp["done"] = True
+                        pos["_tp_hit_ms"] = tms
             if all(l["remain_frac"] <= 1e-9 for l in pos["legs"]):
                 pos["remain_total"] = 0.0
                 return True
@@ -743,9 +756,13 @@ class Sim:
                     else leg["entry"] - R1_LVL * leg["risk_unit"]
                 if (is_long and price >= r1) or (not is_long and price <= r1):
                     fill = r1 * (1 - SLIP) if is_long else r1 * (1 + SLIP)
-                    leg["exits"].append({"price": fill, "frac": R1_FRAC, "ts_ms": tms,
-                                         "reason": f"{R1_LVL:g}R平{R1_FRAC*100:.0f}%"})
-                    leg["remain_frac"] -= R1_FRAC
+                    # 数量守恒不变量 (审查八): 出场数量不得超过实际成交数量 —
+                    # GR 配置可改, min() 保证累计平仓 <= 1
+                    take = min(R1_FRAC, leg["remain_frac"])
+                    if take > 1e-9:
+                        leg["exits"].append({"price": fill, "frac": take, "ts_ms": tms,
+                                             "reason": f"{R1_LVL:g}R平{R1_FRAC*100:.0f}%"})
+                        leg["remain_frac"] -= take
                     leg["stop"] = leg["entry"]
                     leg["t1_done"] = True
             # 3) +R2 平 F2 (r_ladder 规则; hybrid=先1R半仓保本后全跟交易员, 跳过R2)
@@ -755,9 +772,11 @@ class Sim:
                     else leg["entry"] - R2_LVL * leg["risk_unit"]
                 if (is_long and price >= r2) or (not is_long and price <= r2):
                     fill = r2 * (1 - SLIP) if is_long else r2 * (1 + SLIP)
-                    leg["exits"].append({"price": fill, "frac": R2_FRAC, "ts_ms": tms,
-                                         "reason": f"{R2_LVL:g}R平{R2_FRAC*100:.0f}%"})
-                    leg["remain_frac"] -= R2_FRAC
+                    take = min(R2_FRAC, leg["remain_frac"])
+                    if take > 1e-9:
+                        leg["exits"].append({"price": fill, "frac": take, "ts_ms": tms,
+                                             "reason": f"{R2_LVL:g}R平{R2_FRAC*100:.0f}%"})
+                        leg["remain_frac"] -= take
                     leg["t2_done"] = True
             # 4) 30 天上限(到点平剩余)
             cap_ms = pos["first_fill_ms"] + POSITION_CAP_D * 86400 * 1000
@@ -891,26 +910,6 @@ class Sim:
         prev = last_sig.get(symbol)
         if prev and prev[0] == dedup and sig["ts_ms"] - prev[1] < DEDUPE_H * 3600 * 1000:
             return
-        last_sig[symbol] = (dedup, sig["ts_ms"])
-
-        if base in positions:
-            old = positions.pop(base)
-            px = self.mkt.tick_price_at(old["symbol"], old["source"],
-                                        max(sig["ts_ms"], int(old["walked_ms"] or 0)))
-            for leg in old["legs"]:
-                if leg["remain_frac"] <= 1e-9:
-                    continue
-                # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
-                if sig["ts_ms"] < leg.get("fill_ms", 0):
-                    leg["remain_frac"] = 0.0
-                    leg["cancelled_before_fill"] = True   # 显式标记 → _finish 不收开仓费
-                    continue
-                leg["exits"].append({"price": px or leg["entry"],
-                                     "frac": leg["remain_frac"],
-                                     "ts_ms": sig["ts_ms"], "reason": "换新撤旧"})
-                leg["remain_frac"] = 0.0
-            old["status"] = "closed"   # 否则报告按 status=="closed" 筛选时漏计
-            self._finish(old)
 
         msg_ms = sig["ts_ms"]
         if market_entry:
@@ -1048,14 +1047,38 @@ class Sim:
         for ep, fpx, ftms in legs_spec:
             # P0 修复: entry/risk_unit 用**实际成交价** fpx(市价/STOP 含滑点),
             # 而非触发价 ep — 否则止损距离、仓位、手续费与 R 全部失真
+            # 逐腿方向校验 (审查八): LONG 成交价必须高于止损, SHORT 反之 —
+            # 平均价校验+abs() 会把"腿价已越过止损"伪装成正常风险距离
             risk_unit = abs(fpx - sl)
-            if risk_unit <= 0:
+            if risk_unit <= 0 or (is_long and fpx <= sl) or (not is_long and fpx >= sl):
                 continue
             legs.append({"entry": fpx, "risk_unit": risk_unit, "risk_share": 1.0 / n,
                          "remain_frac": 1.0, "stop": sl, "t1_done": False,
                          "t2_done": False, "fill_ms": ftms, "exits": []})
         if not legs:
+            self._skip(sig, base, side, "无有效入场腿(成交价越过止损)")
             return
+        # 换仓契约 (审查八): replace_on_fill — 新信号**实际成交**后才撤旧换新;
+        # 未成交的新信号(STOP未触发/LIMIT未成交/无有效腿)不影响旧仓。
+        # 旧实现在撮合之前先撤旧仓, 新单未成交也把旧仓系统性提前平掉
+        if base in positions:
+            old = positions.pop(base)
+            px = self.mkt.tick_price_at(old["symbol"], old["source"],
+                                        max(first_fill_ms, int(old["walked_ms"] or 0)))
+            for leg in old["legs"]:
+                if leg["remain_frac"] <= 1e-9:
+                    continue
+                # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
+                if first_fill_ms < leg.get("fill_ms", 0):
+                    leg["remain_frac"] = 0.0
+                    leg["cancelled_before_fill"] = True   # 显式标记 → _finish 不收开仓费
+                    continue
+                leg["exits"].append({"price": px or leg["entry"],
+                                     "frac": leg["remain_frac"],
+                                     "ts_ms": first_fill_ms, "reason": "换新撤旧"})
+                leg["remain_frac"] = 0.0
+            old["status"] = "closed"   # 否则报告按 status=="closed" 筛选时漏计
+            self._finish(old)
         # tp_ladder 规则: 信号自带的止盈位(图读或文字), 每档平 1/N
         # hybrid(2026-09-28): 同样构建 TP 阶梯——+R1 平 F1+保本后, 剩余跟此阶梯+喊单
         tp_ladder = []
@@ -1092,6 +1115,9 @@ class Sim:
                    str(sig.get("stop_timeframe") or ""), 60),
                "force_closed": False}
         positions[base] = pos
+        # 去重登记放在成交确认之后 (审查八): 未成交信号的重复发送可被重试,
+        # 不会被去重表吞掉; 已成交信号的短时重复仍按 DEDUPE_H 忽略
+        last_sig[symbol] = (dedup, sig["ts_ms"])
         self.mkt.prefetch(symbol, source, msg_ms, msg_ms + 6 * 86400 * 1000)
 
     def _skip(self, sig, base, side, reason):

@@ -230,7 +230,7 @@ def test_cancelled_before_fill_leg_zero_fee(engine_mod):
     positions, last_sig = {}, {}
     sig1 = {"id": "a", "ts_ms": 60_000, "text": "", "symbol": "TESTUSDT",
             "side": "LONG", "order_type": "LIMIT", "entry_price": 90.0,
-            "entry_prices": [90.0, 80.0], "sl": 82.0, "tp_levels": [110.0],
+            "entry_prices": [90.0, 80.0], "sl": 75.0, "tp_levels": [110.0],
             "stop_trigger_type": None, "stop_timeframe": None}
     sim._handle_open(sig1, positions, last_sig, {})
     assert "TEST" in positions and len(positions["TEST"]["legs"]) == 2

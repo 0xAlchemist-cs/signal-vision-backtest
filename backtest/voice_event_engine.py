@@ -57,6 +57,8 @@ class Config:
     max_lots: float = 0.02
     r_action: str = "half_be"          # "flat" | "half_be" | "be_only" | "none"
     on_new_signal: str = "close_and_open"  # "close_and_open" | "ignore_same_dir"
+    # ignore_same_dir 契约 (审查八): 只保护**已成交持仓** — 同向新信号被忽略;
+    # 同向**未成交挂单**(含 WAITING_FILL)始终允许换新(撤旧挂新, 无盈亏)
     entry_timeout_min: int = 1440      # 24h
     price_guard_pct: float = 0.35
     secure_profit_half: bool = True    # trader's "secure profit" -> close half + BE

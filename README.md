@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-54%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-62%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -393,6 +393,18 @@ python -m backtest.voice_event_engine \
 - **P1（主引擎）**：TP 阶梯**先去重再定档数**——解析出 [105,105] 时旧实现分母 2、阶梯只有 1 档，每档只平 50%，剩余 50% 永不触发；现在去重后 1 档平全仓，比例总和恒为 100%
 - **TP 契约（明示，不改行为）**：TP 档为整个 setup 共享、每档只触发一次——触发时只平**当时已成交**的腿，之后才成交的腿（DCA 追单）不回补该档（保守口径，避免对迟到腿二次计盈亏；代码注释已声明）
 - 回归测试 49 → 54 个
+
+## v0.2.9 修复记录（第八轮审计回应）
+
+主题：订单归属与数量守恒。两条长期不变量进入回归测试：**出场数量总和 ≤ 实际成交数量**；**管理消息必须属于有效的持仓生命周期**。
+
+- **高（换仓契约）**：显式化为 **replace_on_fill**——新信号**实际成交**后才撤旧换新；未成交的新信号（STOP 未触发 / LIMIT 未成交 / 无有效腿）不再影响旧仓。旧实现在撮合之前先撤旧仓，新单未成交也会把旧仓系统性提前平掉。配套修复：`last_sig` 去重登记移到成交确认之后——未成交信号的重复发送可被重试，不再被去重表吞掉
+- **P0（管理消息生命周期）**：早于本 setup 开仓信号的管理消息对**本仓失效**——消费但不执行。旧实现中前一持仓止损离场后遗留的 CLOSE_ALL（同标的队列）会误杀下一笔新仓（跨交易污染的第二种形态）
+- **P0（逐腿方向校验）**：每条腿独立校验成交价与止损的方向关系（LONG 成交价必须高于止损，SHORT 反之），无效腿剔除并重新分配风险；全部无效则整单 skip 并注明。旧实现只校验平均入场价，`abs()` 会把"腿价已越过止损"伪装成正常风险距离
+- **P1（TP 空消耗）**：TP 档至少有一条有效腿完成**非零**止盈才标记 done——无持仓可平时的空触及不再消耗该档，迟到腿（DCA 追单）保留止盈资格
+- **P1（数量守恒）**：R 阶梯出场 `take = min(配置比例, 当前剩余)`——GR 环境变量可配置（如 70%+70%），旧实现会记录 140% 的出场数量使 remain_frac 变负
+- **P2（voice ignore_same_dir 契约明示）**：只保护**已成交持仓**（同向新信号忽略）；同向**未成交挂单**（含 WAITING_FILL）始终允许换新。契约写入 Config 注释，两侧行为均有钉住测试
+- 回归测试 54 → 62 个（第八轮 8 条：6 红 2 绿钉住）
 
 ## License
 
