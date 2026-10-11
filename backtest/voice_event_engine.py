@@ -155,7 +155,10 @@ def run(kl, evs, cfg: Config):
         # TP/SL 冲突按路径模式解析, 不再固定先查止损) ---
         if pos:
             d = 1 if pos["side"] == "BUY" else -1
-            i0 = bisect_left(starts, pos["lw"])
+            # lw 常在分钟中间(如 30s 的 BE 事件之后): 起点必须 floor 到该分钟
+            # bar, 否则同 bar 剩余 tick(如 40s 的 TP)被永久跳过 — 已处理 tick
+            # 由下方 tms <= lw 过滤
+            i0 = pos["lw"] // 60_000
             i1 = bisect_left(starts, ts)
             for n in range(i0, min(i1, len(kl))):
                 b = kl[n]
@@ -170,23 +173,23 @@ def run(kl, evs, cfg: Config):
                     if tms <= pos["lw"]:
                         continue
                     if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
-                        close_part(pos["sl"], pos["qty"], b[0],
+                        close_part(pos["sl"], pos["qty"], tms,
                                    "BE" if pos.get("be") else "SL")
                         done = True
                         break
                     if pos["tp"] and ((price >= pos["tp"]) if d == 1 else (price <= pos["tp"])):
-                        close_part(pos["tp"], pos["qty"], b[0], "TP")
+                        close_part(pos["tp"], pos["qty"], tms, "TP")
                         done = True
                         break
                     if not pos.get("r1_done") and cfg.r_action != "none":
                         r1 = pos["entry"] + d * pos["unit"]
                         if (price >= r1) if d == 1 else (price <= r1):
                             if cfg.r_action == "flat":
-                                close_part(r1, pos["qty"], b[0], "1R flat")
+                                close_part(r1, pos["qty"], tms, "1R flat")
                                 done = True
                                 break
                             if cfg.r_action == "half_be":
-                                close_part(r1, round(pos["qty"] / 2, 2), b[0], "1R half")
+                                close_part(r1, round(pos["qty"] / 2, 2), tms, "1R half")
                                 if pos:
                                     pos["sl"] = pos["entry"]
                                     pos["be"] = True
@@ -237,10 +240,12 @@ def run(kl, evs, cfg: Config):
                 continue
             if entry is not None and (entry <= 0 or abs(entry - ref) / ref > cfg.price_guard_pct):
                 continue
-            # 成交: 限价 = 之后首根触及 bar (PENDING); 市价型 = 消息所在分钟的
-            # 收盘 (该分钟收盘是消息后第一个可知的 bar 收盘价, fill 时点 = 分钟末)
+            # 成交: 限价 = 之后首根触及 bar (PENDING); 市价型 = **消息后首个
+            # 合成 tick** 的价格(消息所在 bar 起, tms >= ts 过滤) — 与主引擎
+            # "消息后首个已知价" 语义一致, 整点/分钟中间/分钟末均正确
             fill = None
             fill_bar_ts = None
+            fill_tms = None
             pending = False
             if entry is not None:
                 for n in range(i, min(i + cfg.entry_timeout_min, len(kl))):
@@ -248,14 +253,21 @@ def run(kl, evs, cfg: Config):
                     if b[3] <= entry <= b[2]:
                         fill = entry
                         fill_bar_ts = b[0]
+                        fill_tms = max(ts, b[0])   # 限价触及不早于消息
                         pending = True       # 触及可能发生在 bar 内任意时刻
                         break
             else:
-                mi = i - 1                   # 消息所在分钟 bar (starts[i] > ts 时)
-                if mi < 0:
-                    mi = 0                   # 消息在首根 bar 分钟内 → 该 bar 收盘成交
-                fill = kl[mi][4]
-                fill_bar_ts = kl[mi][0]
+                for n in range(max(0, i - 1), min(i + 1, len(kl))):
+                    b = kl[n]
+                    for tms, price in candle_to_ticks(int(b[0]), float(b[1]),
+                                                      float(b[2]), float(b[3]), float(b[4])):
+                        if tms >= ts:
+                            fill = price
+                            fill_bar_ts = b[0]
+                            fill_tms = tms
+                            break
+                    if fill is not None:
+                        break
             if fill is None:
                 continue
             if any(v <= 0 or abs(v - ref) / ref > cfg.price_guard_pct for v in (fill, sl, tp)):
@@ -277,10 +289,9 @@ def run(kl, evs, cfg: Config):
                                                 math.floor(cfg.risk_per_trade / unit) / 100.0))
             else:
                 lots = cfg.lots_fixed
-            # fill_ts = 成交时刻: 限价=触及 bar 末(确定已成交);
-            # 市价=消息所在分钟末, 但不得早于消息时刻(整点边界)
-            _fill_done = fill_bar_ts + 59_999
-            fill_ts = max(_fill_done, ts) if not pending else None
+            # fill_ts = 成交时刻: 限价=触及 bar 末(确定已成交, 但不早于消息);
+            # 市价=消息后首个 tick (>= 消息时刻)
+            fill_ts = max(fill_tms, ts) if not pending else None
             pos = {"side": side, "entry": fill, "qty": round(lots * cfg.oz_per_lot, 2),
                    "sl": sl, "tp": tp, "unit": unit, "open_ts": ts,
                    "lw": fill_ts if not pending else 0,
@@ -304,7 +315,8 @@ def run(kl, evs, cfg: Config):
                 n += 1
         if pos and not pos.get("pending"):
             d = 1 if pos["side"] == "BUY" else -1
-            i0 = bisect_left(starts, pos["lw"])
+            # 尾部走查同样 floor 到 lw 所在分钟(与事件循环内一致)
+            i0 = pos["lw"] // 60_000
             done = False
             for n in range(i0, len(kl)):
                 b = kl[n]
@@ -314,12 +326,12 @@ def run(kl, evs, cfg: Config):
                     if tms <= pos["lw"]:
                         continue
                     if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
-                        close_part(pos["sl"], pos["qty"], b[0],
+                        close_part(pos["sl"], pos["qty"], tms,
                                    "BE" if pos.get("be") else "SL")
                         done = True
                         break
                     if pos["tp"] and ((price >= pos["tp"]) if d == 1 else (price <= pos["tp"])):
-                        close_part(pos["tp"], pos["qty"], b[0], "TP")
+                        close_part(pos["tp"], pos["qty"], tms, "TP")
                         done = True
                         break
                 if done:

@@ -909,12 +909,14 @@ class Sim:
         # stop_timeframe — 两者是不同的触发概念。
         # (检查必须在 stop_entry 分支内: 公共路径会误杀 MARKET/LIMIT)
         entry_tf_min = 0
-        if stop_entry:
-            # close_based 条件入场: 只在 entry_timeframe 的收盘 tick 判定;
-            # intrabar STOP(未声明收盘确认): 正常逐 tick 触发
-            if str(sig.get("entry_trigger_type") or "").lower() == "close_based":
-                _tf = str(sig.get("entry_timeframe") or "")
-                entry_tf_min = {"1m": 1, "15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(_tf, 0)
+        if stop_entry and str(sig.get("entry_trigger_type") or "").lower() == "close_based":
+            _tf = str(sig.get("entry_timeframe") or "")
+            entry_tf_min = {"1m": 1, "15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(_tf, -1)
+            if entry_tf_min < 0:
+                # 明确要求"XH 收盘确认"但周期不被支持 → 跳过并注明,
+                # 不得静默退化为盘中触发
+                self._skip(sig, base, side, f"不支持的收盘确认周期({_tf})")
+                return
         legs_spec = []
         if market_entry:
             fill_px = fill_tms = None
@@ -950,7 +952,10 @@ class Sim:
                             continue
                         hit = ((is_long and price >= ep) or (not is_long and price <= ep))
                         if hit:
-                            fill = ep * ((1 + SLIP) if is_long else (1 - SLIP))
+                            # v0.2.5: 跳空越过触发价时, 成交价 = 触发 tick 的
+                            # 可执行市场价(含滑点) — 真实 STOP 市价单不可能
+                            # 以穿越前的价格成交
+                            fill = price * ((1 + SLIP) if is_long else (1 - SLIP))
                             got = (ep, fill, tms)
                             break
                     if got:
