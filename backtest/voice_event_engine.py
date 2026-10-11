@@ -153,12 +153,14 @@ def run(kl, evs, cfg: Config):
 
         # --- 推进 FILLED 持仓: tick 级 SL / TP / 1R 判定 (v0.2.3: 同 bar
         # TP/SL 冲突按路径模式解析, 不再固定先查止损) ---
-        if pos:
+        if pos and not pos.get("pending"):
             d = 1 if pos["side"] == "BUY" else -1
-            # lw 常在分钟中间(如 30s 的 BE 事件之后): 起点必须 floor 到该分钟
-            # bar, 否则同 bar 剩余 tick(如 40s 的 TP)被永久跳过 — 已处理 tick
-            # 由下方 tms <= lw 过滤
-            i0 = pos["lw"] // 60_000
+            # lw 常在分钟中间(如 30s 的 BE 事件之后): 起点必须 floor 回 lw
+            # 所在分钟 bar, 否则同 bar 剩余 tick(如 40s 的 TP)被永久跳过。
+            # 时间戳是真实纪元毫秒 — lw//60_000 是"纪元分钟数"而非数组下标
+            # (只有从 0 开始的合成时间戳恰好两者相等), 必须 bisect 得下标;
+            # 已处理 tick 由下方 tms <= lw 过滤
+            i0 = bisect_left(starts, (pos["lw"] // 60_000) * 60_000)
             i1 = bisect_left(starts, ts)
             for n in range(i0, min(i1, len(kl))):
                 b = kl[n]
@@ -315,8 +317,9 @@ def run(kl, evs, cfg: Config):
                 n += 1
         if pos and not pos.get("pending"):
             d = 1 if pos["side"] == "BUY" else -1
-            # 尾部走查同样 floor 到 lw 所在分钟(与事件循环内一致)
-            i0 = pos["lw"] // 60_000
+            # 尾部走查同样 floor 回 lw 所在分钟(与事件循环内一致) —
+            # 必须 bisect 得真实下标(时间戳是纪元毫秒, 不是下标)
+            i0 = bisect_left(starts, (pos["lw"] // 60_000) * 60_000)
             done = False
             for n in range(i0, len(kl)):
                 b = kl[n]

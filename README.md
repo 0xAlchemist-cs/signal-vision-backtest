@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-39%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-43%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -367,6 +367,13 @@ python -m backtest.voice_event_engine \
 - **P1-2**：不支持的收盘确认周期（2H/6H/12H）→ 跳过并在报告注明"不支持的收盘确认周期(2H)"，不再静默退化为盘中触发
 - **P1-3**：voice 市价 fill 语义固化为**消息后首个合成 tick**——整点 / +1ms / 分钟末 -1ms 三边界一致，且不误用前一根 bar 收盘
 - 回归测试 33 → 39 个；路径模式名自 v0.2.4 起由 worst/best 改为 low_first/high_first（描述 tick 顺序而非"悲观/乐观"——两者对 SHORT 的含义相反），补阴线三模式对照测试
+
+## v0.2.6 修复记录（第六轮审查回应）
+
+- **P0（voice）**：FILLED 推进与尾部回放的起点 `i0 = lw // 60_000` 把**纪元分钟数当数组下标**——真实 Unix 时间戳下起点 ≈ 29,000,000 而 klines 数组只有几千根，循环永不执行 → TP/SL 全部失效、持仓错误存活到回测结束。此前回归测试全用从 0 开始的合成时间戳（分钟数恰好等于下标）掩盖了该错误。修复：`i0 = bisect_left(starts, lw 所在分钟起点)` 得真实下标，已处理 tick 仍由 `tms <= lw` 过滤；两处（事件推进 + 尾部回放）同步修改
+- **P1（voice）**：事件驱动的 FILLED 推进补上 PENDING 守卫（尾部回放 v0.2.4 起已有）——此前 PENDING 挂单落穿到推进循环时 lw=0 会从 bar 0 全量走查，未成交挂单可能被幻影 SL/TP 平仓（以从未发生的入场价记账）
+- 主引擎（engine.py）不受影响：走查用时间区间查询，不做下标运算
+- 回归测试 39 → 43 个：**全部改用真实纪元毫秒时间戳**（BASE=1_775_808_000_000），覆盖 事件驱动推进触发 TP / 分钟中间管理事件后的尾部回放 / 无事件尾部回放 / PENDING 挂单不被幻影平仓 四条路径
 
 ## License
 
