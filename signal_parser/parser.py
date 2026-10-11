@@ -144,6 +144,7 @@ def parse_signal(text: str, image_path: str | None = None,
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
     out = _extract_json(content)
     out.setdefault("should_trade", False)
+    out["text"] = text[:3000]   # v0.2.3: 条件入场启发式需要原始文本
     # normalize a few fields
     if out.get("side"):
         out["side"] = str(out["side"]).upper()

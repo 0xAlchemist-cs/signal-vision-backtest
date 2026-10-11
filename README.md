@@ -338,6 +338,15 @@ python -m backtest.voice_event_engine \
 - **P0-4**：`SVB_PATH_MODE=synthetic|worst|best` 三种分钟内路径假设 + 同 bar TP/SL 冲突分钟计数进报告
 - **P1**：撤单腿不再收开仓手续费；BE=已成交腿**实际数量**加权均价（等风险≠等数量）；资金费缺失标的进报告数据质量行；测试重写为真实撮合路径的集成测试（FakeMarket+完整状态机），CI 增加干净安装 smoke
 
+## v0.2.3 修复记录（第三、四轮外部审查回应）
+
+- **P0-1（主引擎）**：管理消息改为 peek/确认消费——25s 的移损指令在 30s 推进截止截断 tick 后不再永久丢失，留回队列在数据末尾前继续生效
+- **P0-2（voice）**：PENDING 挂单的事件分发不再用统一 continue 吞掉一切——新信号按 on_new_signal 撤旧挂单/开新仓；成交前的 close_all=撤单（保守），成交前的 BE/部分止盈被忽略
+- **P0-3**：parser 把原始 text 写进输出（条件入场启发式可用）；引擎读独立的 entry_trigger_type/entry_timeframe（不再借用止损字段）；STOP 同时支持 intrabar 与 close_based 两种触发
+- **P0-4**：SVB_PATH_MODE=synthetic|low_first|high_first；voice 引擎 FILLED 走查（含尾部）全部 tick 化——同 bar TP/SL 冲突按路径模式解析，不再固定先查止损
+- **P1**：BE 加权排除已全平腿并按剩余数量；资金费请求域名改 fapi.binance.com；撤单腿免手续费；CLI smoke 不再吞失败
+- 回归测试 23 个，覆盖审查给出的全部 8 个场景
+
 ## License
 
 MIT

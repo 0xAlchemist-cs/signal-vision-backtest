@@ -40,6 +40,7 @@ Output: legs JSON (one record per close) + summary (win rate, PnL, by reason).
 import argparse
 import json
 import math
+import os
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,26 @@ class Config:
     entry_timeout_min: int = 1440      # 24h
     price_guard_pct: float = 0.35
     secure_profit_half: bool = True    # trader's "secure profit" -> close half + BE
+
+
+PATH_MODE = os.getenv("VE_PATH_MODE", "synthetic")   # synthetic | low_first | high_first
+TICK_OFFSETS = (0, 20_000, 40_000, 59_999)
+
+
+def candle_to_ticks(ts_ms, o, h, l, c):
+    """1m OHLC → 4 合成 tick。low_first 先探低(对 LONG 悲观/SHORT 乐观),
+    high_first 相反, synthetic 按阴阳定顺序 — 同 bar TP/SL 冲突的结果
+    取决于该假设, 报告需配合冲突计数解读。"""
+    if PATH_MODE == "low_first":
+        first, second = l, h
+    elif PATH_MODE == "high_first":
+        first, second = h, l
+    else:
+        bull = c >= o
+        first = l if bull else h
+        second = h if bull else l
+    return [(ts_ms + TICK_OFFSETS[0], o), (ts_ms + TICK_OFFSETS[1], first),
+            (ts_ms + TICK_OFFSETS[2], second), (ts_ms + TICK_OFFSETS[3], c)]
 
 
 def load(events_path: Path, klines_path: Path):
@@ -97,9 +118,17 @@ def run(kl, evs, cfg: Config):
 
     for e in evs:
         ts = e["ts_ms"]
-        # --- 推进 PENDING 限价单: 扫描到当前事件为止是否触及入场 ---
+        # --- PENDING 挂单的事件分发 (v0.2.3: 不再用统一 continue 吞掉信号) ---
         if pos and pos.get("pending"):
-            n_end = bisect_left(starts, ts)          # 开盘时间 < ts 的 bar
+            kind_p = e.get("kind")
+            # 撤单类管理先于触及扫描生效: 撤单时刻与触及先后 OHLC 不可分辨,
+            # 保守处理为撤单(挂单从下一根 bar 起才参与触及判定)
+            if kind_p == "manage" and e.get("ev") == "close_all":
+                pos = None
+                continue
+            # 触及扫描: 只扫**事件时刻之前**开盘的 bar(挂单/上一事件所在分钟
+            # 之后的完整 bar), 到当前事件为止
+            n_end = bisect_left(starts, ts)          # 开盘时间 < ts 所在分钟的 bar
             n = pos["entry_search_from"]
             filled = False
             while n < n_end:
@@ -115,41 +144,54 @@ def run(kl, evs, cfg: Config):
                 n += 1
             pos["entry_search_from"] = max(pos["entry_search_from"], n_end)
             if pos.get("pending"):
-                # 仍未成交: close_all/取消 → 撤单(无盈亏); 其余管理无仓位可作用
-                if e.get("kind") == "manage" and e.get("ev") == "close_all":
-                    pos = None
-                continue
+                # 仍未成交: BE/部分止盈无仓位可作用 → 忽略;
+                # 新 signal 落入下方 signal 分支(撤旧挂单 + 开新仓)
+                if kind_p == "manage":
+                    continue
+                if kind_p != "signal":
+                    continue
 
-        # --- 推进 FILLED 持仓: SL / TP / 1R 判定 ---
+        # --- 推进 FILLED 持仓: tick 级 SL / TP / 1R 判定 (v0.2.3: 同 bar
+        # TP/SL 冲突按路径模式解析, 不再固定先查止损) ---
         if pos:
             d = 1 if pos["side"] == "BUY" else -1
             i0 = bisect_left(starts, pos["lw"])
             i1 = bisect_left(starts, ts)
             for n in range(i0, min(i1, len(kl))):
                 b = kl[n]
-                if (b[3] <= pos["sl"]) if d == 1 else (b[2] >= pos["sl"]):
-                    close_part(pos["sl"], pos["qty"], b[0],
-                               "BE" if pos.get("be") else "SL")
-                    break
-                if pos["tp"] and ((b[2] >= pos["tp"]) if d == 1 else (b[3] <= pos["tp"])):
-                    close_part(pos["tp"], pos["qty"], b[0], "TP")
-                    break
-                if not pos.get("r1_done") and cfg.r_action != "none":
-                    r1 = pos["entry"] + d * pos["unit"]
-                    if (b[2] >= r1) if d == 1 else (b[3] <= r1):
-                        if cfg.r_action == "flat":
-                            close_part(r1, pos["qty"], b[0], "1R flat")
-                            break
-                        if cfg.r_action == "half_be":
-                            close_part(r1, round(pos["qty"] / 2, 2), b[0], "1R half")
-                            if pos:
+                done = False
+                for tms, price in candle_to_ticks(int(b[0]), float(b[1]),
+                                                  float(b[2]), float(b[3]), float(b[4])):
+                    if tms <= pos["lw"]:
+                        continue
+                    if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
+                        close_part(pos["sl"], pos["qty"], b[0],
+                                   "BE" if pos.get("be") else "SL")
+                        done = True
+                        break
+                    if pos["tp"] and ((price >= pos["tp"]) if d == 1 else (price <= pos["tp"])):
+                        close_part(pos["tp"], pos["qty"], b[0], "TP")
+                        done = True
+                        break
+                    if not pos.get("r1_done") and cfg.r_action != "none":
+                        r1 = pos["entry"] + d * pos["unit"]
+                        if (price >= r1) if d == 1 else (price <= r1):
+                            if cfg.r_action == "flat":
+                                close_part(r1, pos["qty"], b[0], "1R flat")
+                                done = True
+                                break
+                            if cfg.r_action == "half_be":
+                                close_part(r1, round(pos["qty"] / 2, 2), b[0], "1R half")
+                                if pos:
+                                    pos["sl"] = pos["entry"]
+                                    pos["be"] = True
+                                    pos["r1_done"] = True
+                            else:  # be_only
                                 pos["sl"] = pos["entry"]
                                 pos["be"] = True
                                 pos["r1_done"] = True
-                        else:  # be_only
-                            pos["sl"] = pos["entry"]
-                            pos["be"] = True
-                            pos["r1_done"] = True
+                if done:
+                    break
             if pos:
                 pos["lw"] = ts
 
@@ -183,8 +225,6 @@ def run(kl, evs, cfg: Config):
             if sl is None or tp is None:
                 continue
             i = bisect_left(starts, ts)
-            if i >= len(kl):
-                continue
             # 参考价 = 消息所在分钟**之前**最后一根已完成 bar 的收盘 (v0.2.2:
             # 旧实现取下一根 bar 收盘 = 未来价)
             ref = known_price(ts)
@@ -259,14 +299,21 @@ def run(kl, evs, cfg: Config):
             done = False
             for n in range(i0, len(kl)):
                 b = kl[n]
-                if (b[3] <= pos["sl"]) if d == 1 else (b[2] >= pos["sl"]):
-                    close_part(pos["sl"], pos["qty"], b[0],
-                               "BE" if pos.get("be") else "SL")
-                    done = True
-                    break
-                if pos["tp"] and ((b[2] >= pos["tp"]) if d == 1 else (b[3] <= pos["tp"])):
-                    close_part(pos["tp"], pos["qty"], b[0], "TP")
-                    done = True
+                # 尾部走查同样 tick 化: 同 bar TP/SL 冲突按路径模式解析
+                for tms, price in candle_to_ticks(int(b[0]), float(b[1]),
+                                                  float(b[2]), float(b[3]), float(b[4])):
+                    if tms <= pos["lw"]:
+                        continue
+                    if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
+                        close_part(pos["sl"], pos["qty"], b[0],
+                                   "BE" if pos.get("be") else "SL")
+                        done = True
+                        break
+                    if pos["tp"] and ((price >= pos["tp"]) if d == 1 else (price <= pos["tp"])):
+                        close_part(pos["tp"], pos["qty"], b[0], "TP")
+                        done = True
+                        break
+                if done:
                     break
             if not done:
                 close_part(kl[-1][4], pos["qty"], kl[-1][0], "end_of_data")

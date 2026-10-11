@@ -102,7 +102,7 @@ def _http_get(url: str, timeout: int = 15):
     raise RuntimeError(f"重试耗尽: {url}")
 
 
-PATH_MODE = os.getenv("SVB_PATH_MODE", "synthetic")   # synthetic | worst | best
+PATH_MODE = os.getenv("SVB_PATH_MODE", "synthetic")   # synthetic | low_first | high_first
 
 
 def candle_to_ticks(ts_ms, o, h, l, c):
@@ -112,9 +112,9 @@ def candle_to_ticks(ts_ms, o, h, l, c):
     worst/best: 强制 先探低后探高 / 先探高后探低 — 对 LONG 前者悲观、
     后者乐观; 对 SHORT 相反。同一根 bar 内 TP 与 SL 均被触及的分钟,
     三种模型会给出不同结果 — 报告的 tp_sl_conflicts 计数标示此类分钟的量。"""
-    if PATH_MODE == "worst":
+    if PATH_MODE == "low_first":
         first, second = l, h
-    elif PATH_MODE == "best":
+    elif PATH_MODE == "high_first":
         first, second = h, l
     else:
         bull = c >= o
@@ -473,7 +473,7 @@ class Sim:
                     for attempt in range(3):
                         try:
                             while start < hi:
-                                url = ("https://api.binance.com/fapi/v1/fundingRate"
+                                url = ("https://fapi.binance.com/fapi/v1/fundingRate"
                                        f"?symbol={sym}&startTime={start}&endTime={hi}&limit=1000")
                                 lst = _http_get(url, timeout=10)
                                 if not isinstance(lst, list) or not lst:
@@ -535,7 +535,8 @@ class Sim:
                                   sig["ts_ms"] + ENTRY_TIMEOUT_H * 3600 * 1000)
         # 等待入场窗口全部落盘(每标的每段最长 240s 的 ensure 兜底由 worker 承担)
         _t0 = time.time()
-        while self.mkt._queue or self.mkt._pending:
+        # getattr 守卫: 测试用 FakeMarket 没有内部队列
+        while getattr(self.mkt, "_queue", None) or getattr(self.mkt, "_pending", None):
             time.sleep(5)
             if time.time() - _t0 > 3600:
                 print("[prefetch] 等待超时 1h, 带缺口继续")
@@ -585,12 +586,13 @@ class Sim:
             p["status"] = "open"
             self._finish(p)
 
-    def _pending_manages(self, mg_by_sym, symbol, upto_ms) -> list:
+    def _peek_manages(self, mg_by_sym, symbol, upto_ms) -> tuple:
+        """返回 (待处理消息副本, 队列引用)。消息**不在此处移除**——
+        由调用方在撮合 tick 真正执行后确认消费(修复: 旧实现先 pop 后可能
+        因 until 截断不执行, 指令永久丢失)。"""
         lst = mg_by_sym.get(symbol, [])
-        out = []
-        while lst and lst[0]["ts_ms"] <= upto_ms:
-            out.append(lst.pop(0))
-        return out
+        pend = [m for m in lst if m["ts_ms"] <= upto_ms]
+        return pend, lst
 
     # ---- tick 推进(秒级: 消息在 tick 之间按毫秒插入) ----
 
@@ -603,7 +605,7 @@ class Sim:
             if t1 <= t0:
                 continue
             self.mkt.ensure(pos["symbol"], pos["source"], t0, t1)
-            pend = self._pending_manages(pos["mg_by_sym"], pos["symbol"], t1)
+            pend, lst_q = self._peek_manages(pos["mg_by_sym"], pos["symbol"], t1)
             pi = 0
             closed = False
             for c in self.mkt.candles(pos["symbol"], t0, t1):
@@ -645,6 +647,9 @@ class Sim:
                     pos["_tp_hit_ms"] = None
                 if closed or pos.get("force_closed"):
                     break
+            # 消费确认: 已执行(pi 之前)的从队列移除; 未执行的(因 t1 截断)
+            # 留在队列, 下一轮 _advance_all 继续尝试 — 修复管理消息永久丢失
+            lst_q[:len(pend)] = pend[pi:]
             if pos["remain_total"] <= 1e-9 or pos.get("force_closed"):
                 pos["status"] = "closed"
                 self._finish(pos)
@@ -789,10 +794,13 @@ class Sim:
             if new_stop:
                 ns = float(new_stop) * mult
             else:
-                _live = [l for l in pos["legs"] if mg_ts >= l.get("fill_ms", 0)]
-                _w = sum((RISK_USDT * l["risk_share"]) / l["risk_unit"] for l in _live) or 1.0
-                ns = sum(l["entry"] * (RISK_USDT * l["risk_share"]) / l["risk_unit"]
-                         for l in _live) / _w
+                _live = [l for l in pos["legs"] if mg_ts >= l.get("fill_ms", 0)
+                         and l["remain_frac"] > 1e-9]
+                # 权重 = 实际剩余数量 Qi = RISK·share·remain/risk_unit
+                _w = sum((RISK_USDT * l["risk_share"] * l["remain_frac"]) / l["risk_unit"]
+                         for l in _live) or 1.0
+                ns = sum(l["entry"] * (RISK_USDT * l["risk_share"] * l["remain_frac"])
+                         / l["risk_unit"] for l in _live) / _w
             eff = ns * ((1 - SLIP) if is_long else (1 + SLIP))
             if (is_long and eff >= tick_price) or (not is_long and eff <= tick_price):
                 for leg in pos["legs"]:
@@ -891,9 +899,18 @@ class Sim:
         # 与 BUY-LIMIT(price<=entry) 触发方向相反)
         ot = str(sig.get("order_type") or "").upper()
         stop_entry = ot == "STOP"
-        # close_based 入场(条件单"4H 收盘跌破 X"): 只在指定周期收盘 tick 判定
-        _tf = str(sig.get("stop_timeframe") or "")
-        stop_tf_min = {"1m": 1, "15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(_tf, 0)
+        # close_based 入场(条件单"4H 收盘跌破 X"): 只在 STOP 分支内按
+        # entry_timeframe 的周期收盘 tick 判定。v0.2.3: 读独立的
+        # entry_trigger_type/entry_timeframe(入场语义), 不再借用止损的
+        # stop_timeframe — 两者是不同的触发概念。
+        # (检查必须在 stop_entry 分支内: 公共路径会误杀 MARKET/LIMIT)
+        entry_tf_min = 0
+        if stop_entry:
+            # close_based 条件入场: 只在 entry_timeframe 的收盘 tick 判定;
+            # intrabar STOP(未声明收盘确认): 正常逐 tick 触发
+            if str(sig.get("entry_trigger_type") or "").lower() == "close_based":
+                _tf = str(sig.get("entry_timeframe") or "")
+                entry_tf_min = {"1m": 1, "15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(_tf, 0)
         legs_spec = []
         if market_entry:
             fill_px = fill_tms = None
@@ -924,7 +941,7 @@ class Sim:
                                                       float(c[3]), float(c[4])):
                         if tms < msg_ms:
                             continue
-                        if stop_tf_min and not (tms // 60_000 % stop_tf_min == stop_tf_min - 1
+                        if entry_tf_min and not (tms // 60_000 % entry_tf_min == entry_tf_min - 1
                                                 and tms % 60_000 == 59_999):
                             continue
                         hit = ((is_long and price >= ep) or (not is_long and price <= ep))

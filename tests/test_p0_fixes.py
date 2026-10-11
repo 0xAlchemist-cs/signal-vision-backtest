@@ -54,7 +54,7 @@ def test_path_mode_best_high_first(engine_mod):
     """best 模式强制先探高(对 LONG 乐观) — 直接改模块属性, 不 reload"""
     old_mode = engine_mod.PATH_MODE
     try:
-        engine_mod.PATH_MODE = "best"
+        engine_mod.PATH_MODE = "high_first"
         ticks = list(engine_mod.candle_to_ticks(60_000, 100.0, 101.0, 99.0, 100.5))
         assert ticks[1][1] == 101.0   # high 在前
     finally:
@@ -127,7 +127,8 @@ class FakeMarket:
     """最小 Market 桩: 提供 Sim 状态机需要的接口, K 线由测试构造。"""
 
     def __init__(self, bars):
-        self.bars = bars                       # [[ts,o,h,l,c], ...] 单标的
+        self.bars = bars
+        self.klines = {}          # run() 的内存驱逐逻辑需要                       # [[ts,o,h,l,c], ...] 单标的
         self.symbol = "TESTUSDT"
 
     def resolve(self, base):
@@ -173,6 +174,7 @@ def test_sim_stop_entry_fill_price_enters_accounting(engine_mod):
     bars = [[60_000, 100, 100.2, 99.9, 100.0]]
     sim = engine_mod.Sim(rule="tp_ladder", mkt=FakeMarket(bars))
     sig = _mk_signal(60_000, "TESTUSDT", "SHORT", "STOP", [100.0], 101.0)
+    sig["entry_trigger_type"] = "intrabar"   # 盘中触发 STOP(非收盘确认)
     positions, last_sig = {}, {}
     sim._handle_open(sig, positions, last_sig, {})
     assert "TEST" in positions, "STOP-SHORT 应在 price<=entry 时触发成交"
