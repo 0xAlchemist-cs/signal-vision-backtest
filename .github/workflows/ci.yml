@@ -22,6 +22,6 @@ jobs:
           python -c "import ast; [ast.parse(open(f, encoding='utf-8').read()) for f in ('backtest/engine.py', 'backtest/voice_event_engine.py', 'signal_parser/parser.py')]; print('syntax OK')"
       - name: Run all tests
         run: python -m pytest tests/ -q --tb=long
-      - name: CLI smoke (parser entry)
+      - name: CLI smoke (parser entry, real exit code)
         if: always()
-        run: python -m signal_parser --text "long btc entry 100 sl 95" || echo "(no API key expected, entry verified)"
+        run: python -m signal_parser --help

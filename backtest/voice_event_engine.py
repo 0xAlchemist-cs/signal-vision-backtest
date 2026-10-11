@@ -41,7 +41,7 @@ import argparse
 import json
 import math
 import os
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,38 +118,38 @@ def run(kl, evs, cfg: Config):
 
     for e in evs:
         ts = e["ts_ms"]
-        # --- PENDING 挂单的事件分发 (v0.2.3: 不再用统一 continue 吞掉信号) ---
+        # --- PENDING 挂单的事件分发 (v0.2.4: 先确认成交, 再按状态执行) ---
         if pos and pos.get("pending"):
             kind_p = e.get("kind")
-            # 撤单类管理先于触及扫描生效: 撤单时刻与触及先后 OHLC 不可分辨,
-            # 保守处理为撤单(挂单从下一根 bar 起才参与触及判定)
-            if kind_p == "manage" and e.get("ev") == "close_all":
-                pos = None
-                continue
-            # 触及扫描: 只扫**事件时刻之前**开盘的 bar(挂单/上一事件所在分钟
-            # 之后的完整 bar), 到当前事件为止
-            n_end = bisect_left(starts, ts)          # 开盘时间 < ts 所在分钟的 bar
+            # 1) 成交推进: 只扫**事件时刻之前已完成**的 bar (bar 末 <= ts) —
+            #    这些 bar 的触及确定发生在事件之前 → 真实成交。
+            #    事件所在分钟及之后的 bar 不参与(撤单与触及先后不可分辨时,
+            #    保守按撤单处理, 由下方 close_all 分支执行)。
+            n_done = bisect_right(starts, ts - 59_999)   # bar 末 <= ts 的数量
             n = pos["entry_search_from"]
-            filled = False
-            while n < n_end:
+            while n < n_done:
                 b = kl[n]
                 if b[3] <= pos["entry"] <= b[2]:
-                    # 成交 → 转 FILLED, 管理从该 bar 收盘之后开始
+                    # 确定成交 → 转 FILLED, 管理从该 bar 收盘之后开始
                     pos["pending"] = False
                     pos["fill_ts"] = starts[n] + 59_999
                     pos["lw"] = pos["fill_ts"]
                     pos["entry_search_from"] = n + 1
-                    filled = True
                     break
                 n += 1
-            pos["entry_search_from"] = max(pos["entry_search_from"], n_end)
+            pos["entry_search_from"] = max(pos["entry_search_from"], n_done)
+            # 2) 按真实状态执行事件
             if pos.get("pending"):
-                # 仍未成交: BE/部分止盈无仓位可作用 → 忽略;
-                # 新 signal 落入下方 signal 分支(撤旧挂单 + 开新仓)
+                # 仍 PENDING: close_all/取消 → 撤挂单(无盈亏);
+                # BE/部分止盈无仓位可作用 → 忽略;
+                # 新 signal → 落入下方 signal 分支(撤旧挂单 + 开新仓)
                 if kind_p == "manage":
+                    if e.get("ev") == "close_all":
+                        pos = None
                     continue
                 if kind_p != "signal":
                     continue
+            # FILLED: 落入下方 manage/signal 分支按真实持仓处理
 
         # --- 推进 FILLED 持仓: tick 级 SL / TP / 1R 判定 (v0.2.3: 同 bar
         # TP/SL 冲突按路径模式解析, 不再固定先查止损) ---
@@ -162,6 +162,11 @@ def run(kl, evs, cfg: Config):
                 done = False
                 for tms, price in candle_to_ticks(int(b[0]), float(b[1]),
                                                   float(b[2]), float(b[3]), float(b[4])):
+                    # 严格时序: tick 超过事件时刻(ts)后不得再触发 — 否则
+                    # 事件之后的未来 tick(如 40s 的 TP)会抢先于事件(30s 的
+                    # 全平)执行 (v0.2.4 修复)
+                    if tms > ts:
+                        break
                     if tms <= pos["lw"]:
                         continue
                     if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
@@ -272,10 +277,14 @@ def run(kl, evs, cfg: Config):
                                                 math.floor(cfg.risk_per_trade / unit) / 100.0))
             else:
                 lots = cfg.lots_fixed
+            # fill_ts = 成交时刻: 限价=触及 bar 末(确定已成交);
+            # 市价=消息所在分钟末, 但不得早于消息时刻(整点边界)
+            _fill_done = fill_bar_ts + 59_999
+            fill_ts = max(_fill_done, ts) if not pending else None
             pos = {"side": side, "entry": fill, "qty": round(lots * cfg.oz_per_lot, 2),
                    "sl": sl, "tp": tp, "unit": unit, "open_ts": ts,
-                   "lw": fill_bar_ts + 59_999 if not pending else 0,
-                   "fill_ts": fill_bar_ts + 59_999 if not pending else None,
+                   "lw": fill_ts if not pending else 0,
+                   "fill_ts": fill_ts,
                    "pending": pending,
                    "entry_search_from": i if pending else 0,
                    "be": False, "r1_done": False}

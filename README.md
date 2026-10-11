@@ -347,6 +347,15 @@ python -m backtest.voice_event_engine \
 - **P1**：BE 加权排除已全平腿并按剩余数量；资金费请求域名改 fapi.binance.com；撤单腿免手续费；CLI smoke 不再吞失败
 - 回归测试 23 个，覆盖审查给出的全部 8 个场景
 
+## v0.2.4 修复记录（第四轮复核回应）
+
+- **P0-A**：修正 test_voice_new_signal_cancels_pending 的无效参数（原 SL 高于 entry、TP 低于 entry → 挂单从未进入 PENDING，测试假阳性）；有效挂单 + 反向信号 → 旧单撤销、新仓建立、盈亏链全验证
+- **P0-B**：close_all 不再直接清除 PENDING——先推进**事件时刻之前已完成 bar** 的成交确认，再按真实状态平仓/撤单（同分钟不可分辨才保守撤）
+- **P0-C**：FILLED 推进的 tick 循环加 `tms > ts` 过滤——事件(10:01:30 全平)之后同 bar 的未来 tick(10:01:40 TP)不再抢先执行
+- **P0-D**：字段契约统一——LIMIT + entry_trigger_type=close_based 由执行层按 STOP 撮合（与解析层同一规则）；官方 examples/conditional_signal.json 的端到端集成测试验证 fill 精确落在 4H 收盘 tick
+- **P1**：CLI smoke 改 `--help` 真实验证退出码（不再 `|| echo` 吞失败）；voice 市价 fill_ts 边界 = max(bar 末, 消息时刻)；BE 权重确认含 remain_frac（剩余数量）；funding 域名确认 fapi.binance.com
+- 回归测试 33 个（23 → 33，新增第四轮 10 个场景）
+
 ## License
 
 MIT

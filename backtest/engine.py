@@ -898,7 +898,11 @@ class Sim:
         # 方向越过才成交 — "跌破 X 开空" 是 SHORT-STOP(price<=entry 触发),
         # 与 BUY-LIMIT(price<=entry) 触发方向相反)
         ot = str(sig.get("order_type") or "").upper()
-        stop_entry = ot == "STOP"
+        # 条件入场契约(v0.2.4): LIMIT + entry_trigger_type=close_based 由
+        # 执行层按 STOP 撮合(收盘确认) — 与解析层同一规则, 官方示例可直接执行
+        stop_entry = (ot == "STOP"
+                      or (ot == "LIMIT"
+                          and str(sig.get("entry_trigger_type") or "").lower() == "close_based"))
         # close_based 入场(条件单"4H 收盘跌破 X"): 只在 STOP 分支内按
         # entry_timeframe 的周期收盘 tick 判定。v0.2.3: 读独立的
         # entry_trigger_type/entry_timeframe(入场语义), 不再借用止损的
