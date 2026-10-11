@@ -785,11 +785,18 @@ class Sim:
         is_long = pos["side"] == "LONG"
         if action in ("CLOSE_ALL", "closed", "stopped_out", "stopped_be"):
             for leg in pos["legs"]:
-                if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
+                if leg["remain_frac"] <= 1e-9:
+                    continue
+                if mg_ts >= leg.get("fill_ms", 0):
                     fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
                     leg["exits"].append({"price": fill, "frac": leg["remain_frac"],
                                          "ts_ms": mg["ts_ms"], "reason": "喊单全平"})
                     leg["remain_frac"] = 0.0
+                else:
+                    # 强制关闭 = 未成交腿一并撤单, 不收开仓费 (审查七修复:
+                    # 旧实现只处理已成交腿, 未来未成交腿被收虚构开仓费)
+                    leg["remain_frac"] = 0.0
+                    leg["cancelled_before_fill"] = True
             pos["remain_total"] = 0.0
             pos["force_closed"] = True
         elif action in ("MOVE_BE", "stop_be", "stop_move"):
@@ -817,11 +824,17 @@ class Sim:
             eff = ns * ((1 - SLIP) if is_long else (1 + SLIP))
             if (is_long and eff >= tick_price) or (not is_long and eff <= tick_price):
                 for leg in pos["legs"]:
-                    if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
+                    if leg["remain_frac"] <= 1e-9:
+                        continue
+                    if mg_ts >= leg.get("fill_ms", 0):
                         fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
                         leg["exits"].append({"price": fill, "frac": leg["remain_frac"],
                                              "ts_ms": mg["ts_ms"], "reason": "移损越价即平"})
                         leg["remain_frac"] = 0.0
+                    else:
+                        # 强制关闭 = 未成交腿一并撤单 (与 CLOSE_ALL 同口径)
+                        leg["remain_frac"] = 0.0
+                        leg["cancelled_before_fill"] = True
                 pos["remain_total"] = 0.0
                 pos["force_closed"] = True
             else:
@@ -986,27 +999,31 @@ class Sim:
             # "CMP till X"/"CMP and X" 型文字 → 生产 zone_two_legs 双腿
             two_leg = bool(re.search(r"(?i)CMP\s*(?:till|until|&|and)\s*\$?\s*\d",
                                      sig.get("text") or ""))
-            # 信号时点现价 = 消息后首个 tick
+            # 信号时点现价 = 消息后首个 tick (审查七: 同时记下该 tick 的时刻 —
+            # 即时撮合的成交时刻是它, 不是消息时刻; 否则成交时间被回填早于
+            # 真实成交, 成交前收到的换新信号会误判该腿已成交)
             ref_px = None
+            ref_tms = None
             for c in candles:
                 for tms, price in candle_to_ticks(int(c[0]), float(c[1]), float(c[2]),
                                                   float(c[3]), float(c[4])):
                     if tms >= msg_ms:
                         ref_px = price
+                        ref_tms = tms
                         break
                 if ref_px is not None:
                     break
             for ep in sorted(set(entry_prices), reverse=not is_long):
                 # 生产 zone_two_legs 语义: "CMP till X" = 市价腿(立即) + 限价腿(挂 X 等回触)
-                if two_leg and not legs_spec:
+                if two_leg and not legs_spec and ref_px is not None:
                     fill = ref_px * (1 + SLIP) if is_long else ref_px * (1 - SLIP)
-                    legs_spec.append((fill, fill, msg_ms))
+                    legs_spec.append((fill, fill, ref_tms))
                 # 限价挂在"立即成交"一侧(买限≥现价/卖限≤现价)时, 交易所按市价立即
                 # 成交而不会等回触
                 if ref_px is not None and ((is_long and ep >= ref_px)
                                            or (not is_long and ep <= ref_px)):
                     fill = ref_px * (1 + SLIP) if is_long else ref_px * (1 - SLIP)
-                    legs_spec.append((fill, fill, msg_ms))
+                    legs_spec.append((fill, fill, ref_tms))
                     continue
                 got = None
                 for c in candles:
@@ -1045,9 +1062,16 @@ class Sim:
         if self.rule in ("tp_ladder", "hybrid"):
             tps = [float(p) * mult for p in (sig.get("tp_levels")
                                              or sig.get("tp_prices") or []) if p]
+            # 先去重再定档数 (审查七): 解析出 [105,105] 时旧实现分母 2、阶梯只有
+            # 1 档 → 每档只平 50%, 剩余 50% 永不触发; 去重后 1 档平全仓
+            tps = sorted(set(tps), reverse=not is_long)
             n_tp = len(tps)
             first_fill = legs_spec[0][1] if legs_spec else None
-            for i, tp in enumerate(sorted(set(tps), reverse=not is_long)):
+            # 契约 (审查七): TP 档为整个 setup 共享、每档只触发一次 — 触发时只平
+            # **当时已成交**的腿, 之后才成交的腿(如 DCA 追单)不回补该档。保守口径:
+            # 避免"TP 已吃一次又对迟到腿二次计盈亏"; 需要逐腿独立 TP 时应让解析层
+            # 拆成多条信号
+            for i, tp in enumerate(tps):
                 skipped = first_fill is not None and (
                     (is_long and tp <= first_fill) or (not is_long and tp >= first_fill))
                 tp_ladder.append({"i": i + 1, "price": tp, "frac": 1.0 / n_tp,

@@ -122,23 +122,32 @@ def run(kl, evs, cfg: Config):
         # --- PENDING 挂单的事件分发 (v0.2.4: 先确认成交, 再按状态执行) ---
         if pos and pos.get("pending"):
             kind_p = e.get("kind")
-            # 1) 成交推进: 只扫**事件时刻之前已完成**的 bar (bar 末 <= ts) —
-            #    这些 bar 的触及确定发生在事件之前 → 真实成交。
-            #    事件所在分钟及之后的 bar 不参与(撤单与触及先后不可分辨时,
-            #    保守按撤单处理, 由下方 close_all 分支执行)。
-            n_done = bisect_right(starts, ts - 59_999)   # bar 末 <= ts 的数量
-            n = pos["entry_search_from"]
-            while n < n_done:
-                b = kl[n]
-                if b[3] <= pos["entry"] <= b[2]:
-                    # 确定成交 → 转 FILLED, 管理从该 bar 收盘之后开始
+            # 1) 成交推进
+            if pos.get("fill_plan"):
+                # 市价 WAITING_FILL: 成交时刻已预定(消息后首个合成 tick) —
+                # 事件时刻到达预定 tick 才转 FILLED; 之前按未成交撤单处理
+                if ts >= pos["fill_plan"][1]:
                     pos["pending"] = False
-                    pos["fill_ts"] = starts[n] + 59_999
+                    pos["fill_ts"] = pos["fill_plan"][1]
                     pos["lw"] = pos["fill_ts"]
-                    pos["entry_search_from"] = n + 1
-                    break
-                n += 1
-            pos["entry_search_from"] = max(pos["entry_search_from"], n_done)
+            else:
+                # 限价挂单: 只扫**事件时刻之前已完成**的 bar (bar 末 <= ts) —
+                # 这些 bar 的触及确定发生在事件之前 → 真实成交。
+                # 事件所在分钟及之后的 bar 不参与(撤单与触及先后不可分辨时,
+                # 保守按撤单处理, 由下方 close_all 分支执行)。
+                n_done = bisect_right(starts, ts - 59_999)   # bar 末 <= ts 的数量
+                n = pos["entry_search_from"]
+                while n < n_done:
+                    b = kl[n]
+                    if b[3] <= pos["entry"] <= b[2]:
+                        # 确定成交 → 转 FILLED, 管理从该 bar 收盘之后开始
+                        pos["pending"] = False
+                        pos["fill_ts"] = starts[n] + 59_999
+                        pos["lw"] = pos["fill_ts"]
+                        pos["entry_search_from"] = n + 1
+                        break
+                    n += 1
+                pos["entry_search_from"] = max(pos["entry_search_from"], n_done)
             # 2) 按真实状态执行事件
             if pos.get("pending"):
                 # 仍 PENDING: close_all/取消 → 撤挂单(无盈亏);
@@ -292,30 +301,43 @@ def run(kl, evs, cfg: Config):
                                                 math.floor(cfg.risk_per_trade / unit) / 100.0))
             else:
                 lots = cfg.lots_fixed
-            # fill_ts = 成交时刻: 限价=触及 bar 末(确定已成交, 但不早于消息);
-            # 市价=消息后首个 tick (>= 消息时刻)
-            fill_ts = max(fill_tms, ts) if not pending else None
+            # 成交状态 (审查七): 市价单的预定成交 tick 可能**晚于**后续事件 —
+            # 消息时刻 ≠ 成交时刻。成交 tick 在未来 → 先 WAITING_FILL(pending,
+            # fill_plan 记预定成交), 成交前的新信号/close_all = 撤单(无盈亏),
+            # 与限价挂单同一状态机; 旧实现直接建仓, 成交前的反向信号会
+            # signal_flip 出一笔不存在的盈亏
+            fill_plan = None
+            if not pending and fill_tms > ts:
+                fill_plan = (fill, fill_tms)
+            fill_ts = None if (pending or fill_plan) else max(fill_tms, ts)
             pos = {"side": side, "entry": fill, "qty": round(lots * cfg.oz_per_lot, 2),
                    "sl": sl, "tp": tp, "unit": unit, "open_ts": ts,
-                   "lw": fill_ts if not pending else 0,
+                   "lw": fill_ts or 0,
                    "fill_ts": fill_ts,
-                   "pending": pending,
+                   "pending": pending or fill_plan is not None,
+                   "fill_plan": fill_plan,
                    "entry_search_from": i if pending else 0,
                    "be": False, "r1_done": False}
 
     if pos:
         if pos.get("pending"):
-            # 事件流结束后, PENDING 挂单仍可能在其后被触及 → 扫描到数据末尾,
-            # 成交则转 FILLED 并继续走查 SL/TP, 未成交则撤单(无盈亏)
-            n = pos["entry_search_from"]
-            while n < len(kl):
-                b = kl[n]
-                if b[3] <= pos["entry"] <= b[2]:
-                    pos["pending"] = False
-                    pos["fill_ts"] = starts[n] + 59_999
-                    pos["lw"] = pos["fill_ts"]
-                    break
-                n += 1
+            if pos.get("fill_plan"):
+                # 市价 WAITING_FILL: 预定成交 tick 必在数据内 → 到点成交
+                pos["pending"] = False
+                pos["fill_ts"] = pos["fill_plan"][1]
+                pos["lw"] = pos["fill_ts"]
+            else:
+                # 事件流结束后, PENDING 挂单仍可能在其后被触及 → 扫描到数据末尾,
+                # 成交则转 FILLED 并继续走查 SL/TP, 未成交则撤单(无盈亏)
+                n = pos["entry_search_from"]
+                while n < len(kl):
+                    b = kl[n]
+                    if b[3] <= pos["entry"] <= b[2]:
+                        pos["pending"] = False
+                        pos["fill_ts"] = starts[n] + 59_999
+                        pos["lw"] = pos["fill_ts"]
+                        break
+                    n += 1
         if pos and not pos.get("pending"):
             d = 1 if pos["side"] == "BUY" else -1
             # 尾部走查同样 floor 回 lw 所在分钟(与事件循环内一致) —

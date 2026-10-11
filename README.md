@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-49%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-54%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -382,6 +382,17 @@ python -m backtest.voice_event_engine \
 - **P0（管理事件丢失）**：孤儿管理消息（未标明币种）并入统一事件时间线，按消息**真实时刻**判断"唯一活跃仓"并认领——旧实现只在遍历开仓信号时认领，最后一条开仓信号之后的管理消息全部丢失（如"最后开仓 → 移保本 → 全平 → 再无信号"场景两条指令都不执行）；且被后续信号才认领时，仓位可能已在中间时段被平掉，归属错位
 - **P1（voice 时间倒置）**：数据截止平仓的时刻改为最后一根已完成 bar 的**收盘**（开盘+59_999）——旧实现记 bar 开盘，分钟中间成交的仓位会出现"出场早于开仓"；腿记录补充 `fill_ts` 字段，回归测试断言所有腿 exit_ts >= fill_ts
 - 回归测试 43 → 49 个
+
+## v0.2.8 修复记录（第七轮审查回应）
+
+主题：订单从"收到信号"到"真正成交"之间的状态与时间一致性。本轮 5 个场景全部先写红测试证伪（旧代码 5/5 复现故障）再修。
+
+- **P0（voice）**：市价单引入 WAITING_FILL 状态——预定成交 tick（消息后首个合成 tick）**晚于**后续事件时（如 05s 信号、20s tick 成交、10s 来新信号/close_all），旧实现已按持仓处理，成交前的反向信号会 signal_flip 出一笔不存在的盈亏。现在与限价挂单同一状态机：成交前的新信号/全平 = 撤单（无盈亏），到点才转 FILLED
+- **P0（主引擎）**：CMP/可立即成交 LIMIT 的即时撮合记录**真实成交时刻**（首个合成 tick 的 ref_tms），不再回填消息时刻 msg_ms——旧口径下成交时间早于真实成交，成交前收到的换新信号会误判该腿已成交
+- **P0（主引擎）**：CLOSE_ALL 与"移损越价即平"两条强制关闭路径统一处理未成交腿——已成交腿按消息时刻平仓，未成交腿显式撤单（`cancelled_before_fill`），不再被收虚构开仓费（与换新撤旧路径同口径）
+- **P1（主引擎）**：TP 阶梯**先去重再定档数**——解析出 [105,105] 时旧实现分母 2、阶梯只有 1 档，每档只平 50%，剩余 50% 永不触发；现在去重后 1 档平全仓，比例总和恒为 100%
+- **TP 契约（明示，不改行为）**：TP 档为整个 setup 共享、每档只触发一次——触发时只平**当时已成交**的腿，之后才成交的腿（DCA 追单）不回补该档（保守口径，避免对迟到腿二次计盈亏；代码注释已声明）
+- 回归测试 49 → 54 个
 
 ## License
 

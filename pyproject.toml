@@ -1,6 +1,6 @@
 [project]
 name = "signal-vision-backtest"
-version = "0.2.7"
+version = "0.2.8"
 description = "AI-vision parsing of Discord trading signals + event-driven backtest on 1m OHLC with configurable intrabar path assumption"
 readme = "README.md"
 requires-python = ">=3.10"
