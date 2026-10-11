@@ -43,8 +43,8 @@ def engine_mod():
 def test_candle_to_ticks_four_slots(engine_mod):
     """1m OHLC 展开 4 tick: 0/20/40/59.999 秒"""
     ticks = list(engine_mod.candle_to_ticks(60_000, 100.0, 101.0, 99.0, 100.5))
-    assert [t for t, _ in ticks] == [60_000, 60_020_000 // 1000 * 1000 + 60_000][:1] + [60_000, 60_000][:0] or True
     tss = [t for t, _ in ticks]
+    assert len(tss) == 4
     assert tss[0] == 60_000            # 0s
     assert tss[1] == 60_000 + 20_000   # 20s
     assert tss[2] == 60_000 + 40_000   # 40s
