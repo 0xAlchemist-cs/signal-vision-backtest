@@ -633,12 +633,13 @@ class Sim:
                 # 同 bar TP/SL 冲突统计: 本 bar 触发了 TP, 且 bar 范围同时覆盖
                 # 止损(路径假设歧义的量度)。v0.2.2: 修复 is_long 未定义的
                 # NameError; _tp_hit_ms 每 bar 必清理, 防残留跨 bar 误计。
+                # 注意: 不按 remain_frac 过滤 — TP 全平后腿的 remain=0,
+                # 但冲突发生在平仓之前的路径上。
                 if pos.get("_tp_hit_ms") is not None:
                     is_long_c = pos["side"] == "LONG"
                     if any(bar_lo <= l["stop"] <= bar_hi
                            for l in pos["legs"]
-                           if l["remain_frac"] > 1e-9
-                           and l.get("fill_ms", 0) <= bar_hi):
+                           if l.get("fill_ms", 0) <= bar_hi):
                         pos["tp_sl_conflicts"] = pos.get("tp_sl_conflicts", 0) + 1
                     pos["_tp_hit_ms"] = None
                 if closed or pos.get("force_closed"):

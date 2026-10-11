@@ -19,3 +19,4 @@ report*.csv
 
 .mimosa/
 work_test/
+*.egg-info/
