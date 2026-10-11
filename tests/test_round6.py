@@ -200,13 +200,22 @@ def test_voice_market_fill_minute_boundaries_v2():
 
 def test_low_first_bearish_bar_short_gets_best():
     ve = _load("v_r6f", "backtest/voice_event_engine.py")
-    ve.PATH_MODE = "low_first"
-    """low_first 模式(先探低): SHORT 的 TP(低价)先触发 → SHORT 最优。
-    (模式名已中性化: low_first/high_first 描述顺序而非'悲观/乐观')"""
-    kl = [[0, 106.0, 109.0, 95.0, 100.0]]   # low95(TP侧) 与 high109(SL侧) 同 bar
-    evs = [{"ts_ms": 1_000, "kind": "signal", "side": "SELL",
-            "entry": None, "sl": 108.0, "tp": 96.0}]
+    """阴线(close<open)在 synthetic 模式默认先探高; low_first 必须覆盖该
+    默认 → SHORT 的 TP(低价)先触发。模式名只描述顺序, 与阴阳线无关。"""
+    kl = [[0, 100.0, 100.0, 100.0, 100.0],      # 信号 bar: 市价 fill = 100
+          [60_000, 106.0, 108.0, 94.0, 100.0]]  # 阴线冲突 bar: 同 bar 触及两者
+    evs = [{"ts_ms": 15_000, "kind": "signal", "side": "SELL",
+            "entry": None, "sl": 108.0, "tp": 94.0}]
     cfg = ve.Config(r_action="none", sizing="fixed", lots_fixed=0.01)
-    res = ve.run(kl, evs, cfg)
-    assert res["legs"] and res["legs"][0]["reason"] == "TP"
-    assert res["legs"][0]["exit"] == pytest.approx(96.0)
+    outcomes = {}
+    for mode in ("low_first", "synthetic", "high_first"):
+        ve.PATH_MODE = mode
+        res = ve.run(kl, evs, cfg)
+        leg = res["legs"][0] if res["legs"] else None
+        outcomes[mode] = (leg["reason"], leg["exit"]) if leg else None
+    # low_first: 80s tick 探低 94 → TP@94 先触发, SHORT 盈利 (+6)
+    assert outcomes["low_first"] == ("TP", pytest.approx(94.0)), outcomes
+    # high_first 与 synthetic(阴线默认先探高): 80s tick 探高 108 → SL@108
+    assert outcomes["high_first"] == ("SL", pytest.approx(108.0)), outcomes
+    assert outcomes["synthetic"] == ("SL", pytest.approx(108.0)), \
+        f"阴线 synthetic 默认先探高, 实际 {outcomes['synthetic']}"
