@@ -740,7 +740,15 @@ class Sim:
             new_stop = (params.get("stop_price") or params.get("new_stop")
                         or params.get("new_sl"))
             mult = pos["mult"]
-            ns = float(new_stop) * mult if new_stop else pos["legs"][0]["entry"]
+            # BE 语义(v0.2.1 修正): 交易员喊"移保本" = 已成交腿的加权均价。
+            # DCA 格式频道(Entry+Dca 双档)实证: 用 DCA 价或首腿价当保本会把
+            # 盈利单系统性算亏(独立审计三案例全部由亏转盈)。仅首腿成交时
+            # 加权均价 == 首腿价, 兼容单入场旧口径。
+            if new_stop:
+                ns = float(new_stop) * mult
+            else:
+                _w = sum(l["risk_share"] for l in pos["legs"]) or 1.0
+                ns = sum(l["entry"] * l["risk_share"] for l in pos["legs"]) / _w
             eff = ns * ((1 - SLIP) if is_long else (1 + SLIP))
             if (is_long and eff >= tick_price) or (not is_long and eff <= tick_price):
                 for leg in pos["legs"]:

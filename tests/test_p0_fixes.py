@@ -27,10 +27,11 @@ def _load(name: str, rel: str):
 
 
 @pytest.fixture(scope="module")
-def engine_mod():
-    # GAULS/SVB 引擎对 import 侧有轻量副作用(.env 读取), 设置 WORK 避免找不到目录
+def engine_mod(tmp_path_factory):
+    # 引擎对 import 侧有轻量副作用(.env 读取); WORK 指向 pytest 管理的临时
+    # 目录 — 不依赖仓库内任何路径(CI checkout 树与本地一致)
     import os
-    os.environ.setdefault("SVB_WORK", str(ROOT / "work_test"))
+    os.environ.setdefault("SVB_WORK", str(tmp_path_factory.mktemp("svb_work")))
     sys.path.insert(0, str(ROOT))
     yield _load("svb_engine", "backtest/engine.py")
     sys.path.pop(0)
@@ -167,3 +168,24 @@ def test_stop_entry_semantics(engine_mod):
     assert price <= ep
     # LIMIT-SHORT: price >= ep 才触发(挂上方等回触) — price=89 < 90 不触发
     assert not (price >= ep)
+
+
+def test_move_be_uses_weighted_avg_not_first_leg(engine_mod):
+    """delta 审计教训: 喊"移保本"= 已成交腿加权均价, 不是 DCA 价/首腿价。
+    两腿成交(100 与 98, 等风险)后喊 BE → 保本位应为 99, 用 DCA 价 98 会把
+    盈利单算亏。"""
+    sim = engine_mod.Sim.__new__(engine_mod.Sim)
+    pos = {"side": "LONG", "rule": "tp_ladder",
+           "legs": [
+               {"entry": 100.0, "risk_unit": 1.0, "risk_share": 0.5,
+                "remain_frac": 1.0, "stop": 95.0, "t1_done": True,
+                "t2_done": True, "fill_ms": 0, "exits": []},
+               {"entry": 98.0, "risk_unit": 1.0, "risk_share": 0.5,
+                "remain_frac": 1.0, "stop": 95.0, "t1_done": True,
+                "t2_done": True, "fill_ms": 0, "exits": []}],
+           "remain_total": 1.0, "tp_ladder": [],
+           "stop_close_based": False, "stop_tf_min": 1}
+    mg = {"item": {"params": {"action_type": "MOVE_BE"}}}
+    sim._apply_manage(pos, mg, tick_price=99.5)
+    stops = {l["stop"] for l in pos["legs"]}
+    assert stops == {99.0}, f"保本位应为加权均价 99.0, 实际 {stops}"
