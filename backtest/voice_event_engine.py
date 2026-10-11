@@ -112,7 +112,8 @@ def run(kl, evs, cfg: Config):
         equity += pnl
         pos["qty"] -= oz
         legs.append({"ts": ts, "side": pos["side"], "entry": pos["entry"],
-                     "exit": px, "qty": oz, "reason": reason, "pnl": round(pnl, 2)})
+                     "exit": px, "qty": oz, "reason": reason, "pnl": round(pnl, 2),
+                     "fill_ts": pos.get("fill_ts")})
         if pos["qty"] <= 1e-9:
             pos = None
 
@@ -340,7 +341,10 @@ def run(kl, evs, cfg: Config):
                 if done:
                     break
             if not done:
-                close_part(kl[-1][4], pos["qty"], kl[-1][0], "end_of_data")
+                # 数据截止平仓: 价格用最后一根已完成 bar 的收盘, 时刻也是
+                # 该 bar 的**收盘**(开盘+59_999) — 旧实现记 bar 开盘, 极端
+                # 情况(分钟中间成交)会出现出场早于开仓的时间倒置
+                close_part(kl[-1][4], pos["qty"], kl[-1][0] + 59_999, "end_of_data")
         else:
             pos = None                # 到期未成交, 撤单
 

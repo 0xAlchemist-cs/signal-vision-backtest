@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-43%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-49%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -374,6 +374,14 @@ python -m backtest.voice_event_engine \
 - **P1（voice）**：事件驱动的 FILLED 推进补上 PENDING 守卫（尾部回放 v0.2.4 起已有）——此前 PENDING 挂单落穿到推进循环时 lw=0 会从 bar 0 全量走查，未成交挂单可能被幻影 SL/TP 平仓（以从未发生的入场价记账）
 - 主引擎（engine.py）不受影响：走查用时间区间查询，不做下标运算
 - 回归测试 39 → 43 个：**全部改用真实纪元毫秒时间戳**（BASE=1_775_808_000_000），覆盖 事件驱动推进触发 TP / 分钟中间管理事件后的尾部回放 / 无事件尾部回放 / PENDING 挂单不被幻影平仓 四条路径
+
+## v0.2.7 修复记录（第六轮审查回应 · 二/三/四/五）
+
+- **P1（费用）**：开仓手续费改为按**显式成交状态**计——换新撤旧的未成交腿打 `cancelled_before_fill` 标记，`_finish` 只看标记，不再由出场时间推断（旧推断在"已成交 + 数据截止出场 ts_ms=None"时误判为未成交，漏收开仓费，净收益被高估）；回归测试按开仓费/平仓费**分项精确对账**，不再只断言"手续费>0"（旧断言只剩平仓费也能通过 = 假阳性）
+- **P1（部分止盈口径）**：喊单 PARTIAL_TP 的 percent 口径显式化为 `SVB_PERCENT_BASIS=original|remaining`——original=每次平**原始仓位**的 percent（阶梯式，两次 50%=全平，已发布回测均用此口径，保持默认）；remaining=平**当前剩余**的 percent（递进式，两次 50%=剩 25%）。同一句喊话不再在不同模块产生不同的数量解释
+- **P0（管理事件丢失）**：孤儿管理消息（未标明币种）并入统一事件时间线，按消息**真实时刻**判断"唯一活跃仓"并认领——旧实现只在遍历开仓信号时认领，最后一条开仓信号之后的管理消息全部丢失（如"最后开仓 → 移保本 → 全平 → 再无信号"场景两条指令都不执行）；且被后续信号才认领时，仓位可能已在中间时段被平掉，归属错位
+- **P1（voice 时间倒置）**：数据截止平仓的时刻改为最后一根已完成 bar 的**收盘**（开盘+59_999）——旧实现记 bar 开盘，分钟中间成交的仓位会出现"出场早于开仓"；腿记录补充 `fill_ts` 字段，回归测试断言所有腿 exit_ts >= fill_ts
+- 回归测试 43 → 49 个
 
 ## License
 

@@ -8,6 +8,7 @@ P0: voice 走查起点 i0 = lw // 60_000 把"纪元分钟数"当数组下标 —
 回归测试必须用真实 Unix 时间戳, 覆盖 事件推进 + 尾部回放 两条路径。
 """
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +25,45 @@ def _load(name: str, rel: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(scope="module")
+def engine_mod(tmp_path_factory):
+    os.environ.setdefault("SVB_WORK", str(tmp_path_factory.mktemp("r7_work")))
+    sys.path.insert(0, str(ROOT))
+    yield _load("svb_engine_r7", "backtest/engine.py")
+    sys.path.pop(0)
+
+
+class FakeMarket:
+    def __init__(self, bars):
+        self.bars = bars
+        self.symbol = "TESTUSDT"
+        self.klines = {}
+
+    def resolve(self, base):
+        return (self.symbol, "fake", 1.0)
+
+    def ensure(self, *a, **k): pass
+
+    def prefetch(self, *a, **k): pass
+
+    def evict(self, *a, **k): pass
+
+    def trim(self, *a, **k): pass
+
+    def candles(self, sym, t0_ms, t1_ms):
+        t0 = (t0_ms // 60_000) * 60_000
+        return [b for b in self.bars if t0 <= b[0] <= t1_ms]
+
+    def tick_price_at(self, sym, source, ts_ms):
+        prev = None
+        for b in self.bars:
+            if b[0] <= ts_ms:
+                prev = b[4]
+            else:
+                break
+        return prev
 
 
 # ---------------------------------------------------------------------------
@@ -135,3 +175,175 @@ def test_pending_limit_not_phantom_closed_by_walk():
                if l["side"] == "SELL" and l["reason"] in ("SL", "BE")]
     assert not phantom, f"未成交挂单被走查幻影平仓: {phantom}"
     assert res["legs"], "新 BUY 市价信号应有成交后的腿"
+
+
+# ---------------------------------------------------------------------------
+# 审查二 (P1): 开仓手续费必须按**显式成交状态**计, 不能由出场时间推断
+# ---------------------------------------------------------------------------
+
+def _mk_sim(engine_mod, bars):
+    sim = engine_mod.Sim.__new__(engine_mod.Sim)
+    sim.rule = "tp_ladder"
+    sim.trades = []
+    sim.funding_missing = set()
+    sim.mkt = FakeMarket(bars)
+    sim._fetch_funding = lambda *a, **k: []   # 测试不联网
+    return sim
+
+
+def _mkt_sig(ts_ms, side="LONG", entry=100.0, sl=95.0):
+    return {"id": f"s{ts_ms}", "ts_ms": ts_ms, "text": "", "symbol": "TESTUSDT",
+            "side": side, "order_type": "MARKET", "entry_price": entry,
+            "entry_prices": [entry], "sl": sl, "tp_levels": [],
+            "stop_trigger_type": None, "stop_timeframe": None}
+
+
+def test_open_fee_charged_for_filled_leg_at_end_of_data(engine_mod):
+    """已成交 + 数据截止(出场 ts_ms=None): 开仓费必须计入。
+    旧实现由出场时间推断 cancelled_before_fill → 出场 ts 全为 None 时
+    误判为未成交 → 只收平仓费 (假阳性: 只断言 fee>0 测不出来)。"""
+    sim = _mk_sim(engine_mod, [[60_000, 100, 100.5, 99.5, 100.0]])
+    positions, last_sig = {}, {}
+    sim._handle_open(_mkt_sig(60_000), positions, last_sig, {})
+    positions["TEST"]["legs"][0]["exits"].append(
+        {"price": 100.0, "frac": 1.0, "ts_ms": None})
+    sim._finish(positions["TEST"])
+    t = sim.trades[-1]
+    leg = t["legs"][0]
+    qty = engine_mod.RISK_USDT * leg["risk_share"] / leg["risk_unit"]
+    close_fee = qty * 100.0 * 1.0 * engine_mod.FEE_RATE
+    open_fee = qty * leg["entry"] * engine_mod.FEE_RATE
+    assert t["fee_usdt"] == pytest.approx(round(open_fee + close_fee, 2)), \
+        f"开仓费 {open_fee} + 平仓费 {close_fee} 都必须计, 实际 {t['fee_usdt']}"
+    assert t["fee_usdt"] > round(close_fee, 2), \
+        "开仓费不得被跳过(旧假阳性: 只剩平仓费时 fee>0 也通过)"
+
+
+def test_cancelled_before_fill_leg_zero_fee(engine_mod):
+    """换新撤旧: 未成交腿(成交 tick 在新信号之后)不收开仓费;
+    已成交腿正常收开仓费+出场费 — 两腿费用分开核对。"""
+    sim = _mk_sim(engine_mod, [
+        [0, 100, 100, 100, 100.0],
+        [60_000, 100, 91, 89, 90.0],       # 触及 LIMIT 90 → 腿1 成交@90
+        [120_000, 90, 95, 79, 80.0],       # 新信号后才会触及 LIMIT 80 → 腿2 被撤
+    ])
+    positions, last_sig = {}, {}
+    sig1 = {"id": "a", "ts_ms": 60_000, "text": "", "symbol": "TESTUSDT",
+            "side": "LONG", "order_type": "LIMIT", "entry_price": 90.0,
+            "entry_prices": [90.0, 80.0], "sl": 82.0, "tp_levels": [110.0],
+            "stop_trigger_type": None, "stop_timeframe": None}
+    sim._handle_open(sig1, positions, last_sig, {})
+    assert "TEST" in positions and len(positions["TEST"]["legs"]) == 2
+    sim._handle_open(_mkt_sig(120_000, entry=80.0, sl=75.0), positions, last_sig, {})
+    cancelled = [t for t in sim.trades
+                 if any(l.get("cancelled_before_fill") for l in t["legs"])]
+    assert cancelled, "被撤的未成交腿必须显式标记 cancelled_before_fill"
+    t = cancelled[0]
+    live = [l for l in t["legs"] if not l.get("cancelled_before_fill")]
+    assert live, "腿1(已成交)应保留"
+    qty = engine_mod.RISK_USDT * live[0]["risk_share"] / live[0]["risk_unit"]
+    expect = qty * live[0]["entry"] * engine_mod.FEE_RATE          # 开仓费
+    for ep in live[0]["exits"]:
+        expect += qty * ep["price"] * ep["frac"] * engine_mod.FEE_RATE
+    assert t["fee_usdt"] == pytest.approx(round(expect, 2)), \
+        f"只有已成交腿计费, 实际 {t['fee_usdt']} 期望 {expect}"
+
+
+# ---------------------------------------------------------------------------
+# 审查三 (P1): PARTIAL_TP 的 percent 口径必须显式 (original|remaining)
+# ---------------------------------------------------------------------------
+
+def _partial_mg(ts_ms, percent=50):
+    return {"ts_ms": ts_ms,
+            "item": {"symbol": "TESTUSDT",
+                     "params": {"action_type": "PARTIAL_TP", "percent": percent}},
+            "text": ""}
+
+
+def test_partial_tp_percent_basis_remaining(engine_mod):
+    """remaining 口径: 每次平**当前剩余**的 50% → 两次喊单剩 25%。
+    旧实现固定 original 口径且无口径配置 → 两次喊单剩 0 (红)。"""
+    engine_mod.PERCENT_BASIS = "remaining"
+    sim = _mk_sim(engine_mod, [
+        [60_000, 100, 100.5, 99.5, 100.0],
+        [120_000, 100, 100.5, 99.5, 100.0],
+    ])
+    positions, last_sig = {}, {}
+    sim._handle_open(_mkt_sig(60_000), positions, last_sig, {})
+    pos = positions["TEST"]
+    tick = sim.mkt.tick_price_at("TESTUSDT", "fake", 70_000)
+    sim._apply_manage(pos, _partial_mg(70_000), tick)
+    sim._apply_manage(pos, _partial_mg(130_000), tick)
+    leg = pos["legs"][0]
+    assert leg["remain_frac"] == pytest.approx(0.25), \
+        f"remaining 口径两次 50% 应剩 25%, 实际 {leg['remain_frac']}"
+    assert sum(ep["frac"] for ep in leg["exits"]) == pytest.approx(0.75)
+
+
+def test_partial_tp_percent_basis_original(engine_mod):
+    """original 口径(默认=已发布回测口径): 每次平**原始仓位**的 50%
+    → 两次喊单全平。钉住默认行为不漂移。"""
+    engine_mod.PERCENT_BASIS = "original"
+    sim = _mk_sim(engine_mod, [
+        [60_000, 100, 100.5, 99.5, 100.0],
+        [120_000, 100, 100.5, 99.5, 100.0],
+    ])
+    positions, last_sig = {}, {}
+    sim._handle_open(_mkt_sig(60_000), positions, last_sig, {})
+    pos = positions["TEST"]
+    tick = sim.mkt.tick_price_at("TESTUSDT", "fake", 70_000)
+    sim._apply_manage(pos, _partial_mg(70_000), tick)
+    sim._apply_manage(pos, _partial_mg(130_000), tick)
+    assert pos["legs"][0]["remain_frac"] == pytest.approx(0.0)
+    assert pos.get("force_closed"), "original 口径两次 50% 应全平"
+
+
+# ---------------------------------------------------------------------------
+# 审查四 (P0): 孤儿管理消息按真实时刻进入事件流 — 不依赖后续开仓信号认领
+# ---------------------------------------------------------------------------
+
+def test_orphan_manages_after_last_signal_applied(engine_mod):
+    """10:00 开仓成交 → 10:05 移保本(无币种) → 10:10 全平(无币种) →
+    之后没有新开仓信号。旧实现只在遍历开仓信号时认领孤儿 →
+    最后一条信号之后的管理消息全部丢失 (红)。"""
+    sim = _mk_sim(engine_mod, [
+        [60_000, 100, 105, 101, 104.0],    # low 101: BE 止损(100.05)之上, 不误触
+        [120_000, 104, 106, 103, 105.0],
+        [180_000, 105, 106, 104, 105.0],
+    ])
+    signals = [_mkt_sig(60_000)]
+    manages = [
+        {"ts_ms": 65_000, "items": [{"params": {"action_type": "MOVE_BE"}}],
+         "text": "move sl to be"},
+        {"ts_ms": 125_000, "items": [{"params": {"action_type": "CLOSE_ALL"}}],
+         "text": "close all"},
+    ]
+    sim.run(signals, manages)
+    assert sim.trades, "应有交易记录"
+    t = sim.trades[-1]
+    last_exit = t["exit_parts"][-1]
+    assert last_exit["reason"] == "喊单全平", \
+        f"信号之后的孤儿管理消息必须执行, 实际 {last_exit['reason']}"
+    assert last_exit["ts_ms"] == 125_000, \
+        f"全平应发生在消息时刻, 实际 {last_exit['ts_ms']}"
+
+
+# ---------------------------------------------------------------------------
+# 审查五 (P1): voice 数据截止平仓时刻 = 最后一根 bar 的收盘, 且 >= 开仓时刻
+# ---------------------------------------------------------------------------
+
+def test_voice_end_of_data_exit_ts_not_before_fill():
+    ve = _load("v_r7e", "backtest/voice_event_engine.py")
+    """分钟中间市价成交(+00:40) + 单根 bar: 旧实现把数据截止平仓记在
+    bar 开盘(+00:00) — 早于开仓时刻。必须记在 bar 收盘(+00:59.999)。"""
+    kl = [[BASE, 100, 100, 100, 100.0]]
+    evs = [{"ts_ms": BASE + 30_000, "kind": "signal", "side": "BUY",
+            "entry": None, "sl": 90.0, "tp": 110.0}]
+    cfg = ve.Config(r_action="none", sizing="fixed", lots_fixed=0.01)
+    res = ve.run(kl, evs, cfg)
+    assert res["legs"] and res["legs"][0]["reason"] == "end_of_data"
+    for leg in res["legs"]:
+        assert leg["ts"] == BASE + 59_999, \
+            f"数据截止平仓应记在最后一根 bar 收盘, 实际 {leg['ts']}"
+        assert leg["ts"] >= leg["fill_ts"], \
+            f"出场时间不得早于开仓时间: exit={leg['ts']} fill={leg['fill_ts']}"

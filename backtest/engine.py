@@ -75,6 +75,10 @@ R2_LVL = float(os.getenv("GR2_LVL", "2.0"))
 R2_FRAC = float(os.getenv("GR2_FRAC", "0.40"))
 FEE_RATE = 0.00025          # taker per side
 SLIP = float(os.getenv("SVB_SLIP", "0.0005"))   # market/stop slippage per side
+# 喊单部分止盈的 percent 口径 (审查三): original = 每次平**原始仓位**的 percent
+# (阶梯式: 两次 50% = 全平, 已发布回测报告均用此口径); remaining = 平**当前
+# 剩余**的 percent (递进式: 两次 50% = 剩 25%)。显式配置, 不留歧义
+PERCENT_BASIS = os.getenv("SVB_PERCENT_BASIS", "original")   # original|remaining
 ENTRY_TIMEOUT_H = 48
 POSITION_CAP_D = 30
 DEDUPE_H = 6
@@ -545,16 +549,25 @@ class Sim:
         positions: dict[str, dict] = {}
         last_sig: dict[str, tuple] = {}
 
-        for sig in signals:
-            self._advance_all(positions, sig["ts_ms"])
-            # 孤儿管理消息: 仅当唯一活跃仓时认领(与生产单仓口径一致)
-            while orphans and orphans[0]["ts_ms"] <= sig["ts_ms"]:
-                o = orphans.pop(0)
+        # 事件时间线 (审查四修复): 开仓信号 + 孤儿管理消息按 ts 归并 — 孤儿
+        # 消息在其**真实时刻**判断"唯一活跃仓"并认领。旧实现只在遍历开仓信号
+        # 时认领 → 最后一条开仓信号之后的管理消息全部丢失; 且被后续信号认领
+        # 时, 仓位可能已在中间时段被止损/止盈平掉, 归属错位
+        timeline = sorted([("sig", s["ts_ms"], s) for s in signals]
+                          + [("orph", o["ts_ms"], o) for o in orphans],
+                          key=lambda x: x[1])
+
+        for kind, ev_ts, obj in timeline:
+            if kind == "orph":
+                self._advance_all(positions, ev_ts)
                 if len(positions) == 1:
                     only = next(iter(positions.values()))
                     mg_by_sym.setdefault(only["symbol"], []).append(
-                        {"ts_ms": o["ts_ms"], "item": o["item"], "text": o["text"]})
+                        {"ts_ms": ev_ts, "item": obj["item"], "text": obj["text"]})
                     mg_by_sym[only["symbol"]].sort(key=lambda x: x["ts_ms"])
+                continue
+            sig = obj
+            self._advance_all(positions, sig["ts_ms"])
             self._handle_open(sig, positions, last_sig, mg_by_sym)
             if len(self.mkt.klines) > 48:
                 active = {p["symbol"] for p in positions.values()}
@@ -821,7 +834,10 @@ class Sim:
             fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
             for leg in pos["legs"]:
                 if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
-                    frac = min(pct, leg["remain_frac"])
+                    if PERCENT_BASIS == "remaining":
+                        frac = leg["remain_frac"] * pct
+                    else:
+                        frac = min(pct, leg["remain_frac"])
                     leg["exits"].append({"price": fill, "frac": frac, "ts_ms": mg["ts_ms"],
                                          "reason": f"喊单止盈{params.get('percent', 50):g}%"})
                     leg["remain_frac"] -= frac
@@ -874,6 +890,7 @@ class Sim:
                 # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
                 if sig["ts_ms"] < leg.get("fill_ms", 0):
                     leg["remain_frac"] = 0.0
+                    leg["cancelled_before_fill"] = True   # 显式标记 → _finish 不收开仓费
                     continue
                 leg["exits"].append({"price": px or leg["entry"],
                                      "frac": leg["remain_frac"],
@@ -1064,11 +1081,10 @@ class Sim:
         for leg in pos["legs"]:
             # 名义价值口径: 数量 = 该腿风险金 / 单位风险
             qty = (RISK_USDT * leg["risk_share"]) / leg["risk_unit"]
-            # P1 修复: 未成交即被撤单的腿(fill_ms 在撤单之后)没有开仓, 不收
-            # 开仓手续费; 出场费只按真实出场记录计
-            cancelled_before_fill = (leg["fill_ms"] > max(
-                (e["ts_ms"] for e in leg["exits"] if e.get("ts_ms")), default=0))
-            if not cancelled_before_fill:
+            # 开仓费按**显式成交状态**计: 只有未成交即被撤单的腿(换新撤旧路径
+            # 打标记)不收。不看出场时间推断 — 数据截止持仓(出场 ts_ms=None)
+            # 曾被误判为未成交而漏收开仓费, 净收益被高估
+            if not leg.get("cancelled_before_fill"):
                 fee_usdt += qty * leg["entry"] * FEE_RATE
             for ep in leg["exits"]:
                 move = ((ep["price"] - leg["entry"]) if pos["side"] == "LONG"
