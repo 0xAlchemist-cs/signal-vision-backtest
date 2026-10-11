@@ -183,9 +183,9 @@ def test_move_be_uses_weighted_avg_not_first_leg(engine_mod):
                {"entry": 98.0, "risk_unit": 1.0, "risk_share": 0.5,
                 "remain_frac": 1.0, "stop": 95.0, "t1_done": True,
                 "t2_done": True, "fill_ms": 0, "exits": []}],
-           "remain_total": 1.0, "tp_ladder": [],
+           "remain_total": 1.0, "tp_ladder": [], "mult": 1.0,
            "stop_close_based": False, "stop_tf_min": 1}
-    mg = {"item": {"params": {"action_type": "MOVE_BE"}}}
+    mg = {"ts_ms": 1_000, "item": {"params": {"action_type": "MOVE_BE"}}}
     sim._apply_manage(pos, mg, tick_price=99.5)
     stops = {l["stop"] for l in pos["legs"]}
     assert stops == {99.0}, f"保本位应为加权均价 99.0, 实际 {stops}"
