@@ -356,6 +356,15 @@ python -m backtest.voice_event_engine \
 - **P1**：CLI smoke 改 `--help` 真实验证退出码（不再 `|| echo` 吞失败）；voice 市价 fill_ts 边界 = max(bar 末, 消息时刻)；BE 权重确认含 remain_frac（剩余数量）；funding 域名确认 fapi.binance.com
 - 回归测试 33 个（23 → 33，新增第四轮 10 个场景）
 
+## v0.2.5 修复记录（第五轮复核回应）
+
+- **P0-1（voice）**：FILLED 走查（含尾部）起点由 `bisect(starts, lw)` 改为 `lw // 60_000` floor 对齐——lw 停在分钟中间（如 01:30 的移保本指令）时不再跳过该分钟剩余 tick（旧 bug 会永久漏掉 01:40 的 TP）；已处理 tick 由 `tms <= lw` 过滤兜底
+- **P0-2（主引擎）**：STOP 触发的跳空成交价改为**触发后 tick 的可执行价**（LONG = tick 价 × (1+滑点)），不再用"触发价+滑点"——行情跳空越过触发价时，旧口径会以市场上不存在的价格成交，risk_unit/手续费/R 全部按实际成交价重算
+- **P1-1**：数据截止仍持仓的腿（exits `ts_ms=None`）计入开仓手续费——end_of_data 平仓不允许漏收
+- **P1-2**：不支持的收盘确认周期（2H/6H/12H）→ 跳过并在报告注明"不支持的收盘确认周期(2H)"，不再静默退化为盘中触发
+- **P1-3**：voice 市价 fill 语义固化为**消息后首个合成 tick**——整点 / +1ms / 分钟末 -1ms 三边界一致，且不误用前一根 bar 收盘
+- 回归测试 33 → 39 个；路径模式名自 v0.2.4 起由 worst/best 改为 low_first/high_first（描述 tick 顺序而非"悲观/乐观"——两者对 SHORT 的含义相反），补阴线三模式对照测试
+
 ## License
 
 MIT
