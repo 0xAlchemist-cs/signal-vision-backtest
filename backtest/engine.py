@@ -637,9 +637,10 @@ class Sim:
                 # 但冲突发生在平仓之前的路径上。
                 if pos.get("_tp_hit_ms") is not None:
                     is_long_c = pos["side"] == "LONG"
+                    # 腿在 TP 触发前已成交(fill_ms <= _tp_hit_ms 毫秒)才计入
                     if any(bar_lo <= l["stop"] <= bar_hi
                            for l in pos["legs"]
-                           if l.get("fill_ms", 0) <= bar_hi):
+                           if l.get("fill_ms", 0) <= pos["_tp_hit_ms"]):
                         pos["tp_sl_conflicts"] = pos.get("tp_sl_conflicts", 0) + 1
                     pos["_tp_hit_ms"] = None
                 if closed or pos.get("force_closed"):

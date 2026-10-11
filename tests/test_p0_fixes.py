@@ -282,8 +282,8 @@ def test_advance_all_conflict_stats_no_nameerror(engine_mod):
     t0 = 60_000
     for n in range(6):
         t = t0 + n * 60_000
-        # bar2/high=106 触发 TP105 且 low=96 覆盖 SL97 → 同 bar 冲突
-        bars.append([t, 100.0, 106.0, 96.0, 105.5] if n == 2
+        # bar2 用阴线(high→low 路径): 先触发 TP105, 后覆盖 SL97 → 同 bar 冲突
+        bars.append([t, 106.0, 107.0, 95.0, 96.0] if n == 2
                     else [t, 100.0, 100.5, 99.5, 100.0])
     sim.mkt = FakeMarket(bars)
     pos = {"symbol": "TESTUSDT", "source": "fake", "base": "TEST",
