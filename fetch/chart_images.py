@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-_ALLOW = "cdn.discordapp.com"
+_ALLOW_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -25,7 +25,7 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 def _guard(url: str) -> None:
     p = urlparse(url)
-    if p.scheme != "https" or p.hostname != _ALLOW:
+    if p.scheme != "https" or p.hostname not in _ALLOW_HOSTS:
         raise ValueError(f"blocked: {url}")
     for _, _, _, _, sockaddr in socket.getaddrinfo(p.hostname, 443):
         ip = ipaddress.ip_address(sockaddr[0])

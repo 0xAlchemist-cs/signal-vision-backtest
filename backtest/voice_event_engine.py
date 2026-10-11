@@ -145,19 +145,30 @@ def run(kl, evs, cfg: Config):
             i = bisect_left(starts, ts)
             if i >= len(kl):
                 continue
-            ref = kl[i][4]
+            # 参考价(护栏/缺省入场) = 消息时刻**之前**最后一根已完成 bar 的收盘。
+            # 修复前视偏差: 旧实现 bisect_left 直接取下一根 bar 的收盘(未来价)。
+            j = i - 1
+            ref = kl[j][4] if j >= 0 else None
+            if ref is None:
+                continue
             if entry is not None and (entry <= 0 or abs(entry - ref) / ref > cfg.price_guard_pct):
                 continue
-            # fill: limit touch within window, else first-bar close for market-style alerts
+            # fill: limit touch within window, else next completed bar close for
+            # market-style alerts (fill time = that bar's close, no look-ahead)
             fill = None
+            fill_bar_ts = None
             if entry is not None:
                 for n in range(i, min(i + cfg.entry_timeout_min, len(kl))):
                     b = kl[n]
                     if b[3] <= entry <= b[2]:
                         fill = entry
+                        fill_bar_ts = b[0]
                         break
             else:
-                fill = ref
+                if i >= len(kl):
+                    continue
+                fill = kl[i][4]          # 消息后首根完整 bar 的收盘
+                fill_bar_ts = kl[i][0]
             if fill is None:
                 continue
             if any(v <= 0 or abs(v - ref) / ref > cfg.price_guard_pct for v in (fill, sl, tp)):
@@ -169,14 +180,17 @@ def run(kl, evs, cfg: Config):
             if pos:
                 if cfg.on_new_signal == "ignore_same_dir" and pos["side"] == side:
                     continue
-                close_part(kl[i][4], pos["qty"], ts, "signal_flip")
+                close_part(ref, pos["qty"], ts, "signal_flip")
             if cfg.sizing == "risk":
                 lots = min(cfg.max_lots, max(cfg.min_lots,
                                                 math.floor(cfg.risk_per_trade / unit) / 100.0))
             else:
                 lots = cfg.lots_fixed
+            # lw: 持仓管理起点 = 成交 bar 的收盘 tick。修复前视偏差: 旧实现用
+            # 消息 ts, 限价腿会在"成交前的时段"就被止损/止盈判定(未来管理)。
             pos = {"side": side, "entry": fill, "qty": round(lots * cfg.oz_per_lot, 2),
-                   "sl": sl, "tp": tp, "unit": unit, "open_ts": ts, "lw": ts,
+                   "sl": sl, "tp": tp, "unit": unit, "open_ts": ts,
+                   "lw": fill_bar_ts + 59_999,
                    "be": False, "r1_done": False}
 
     if pos:

@@ -81,12 +81,25 @@ def fetch_channel(channel_id: str, out_path: Path, token: str | None = None) -> 
             if not batch:
                 break
             for m in reversed(batch):
+                atts = [{"url": a.get("url"), "filename": a.get("filename")}
+                        for a in (m.get("attachments") or [])]
+                # 机器人镜像频道的图表在 embed 的 image/thumbnail 字段
+                # (客户端里"看得见图"), 必须并入附件列表, 否则漏抓全部图表
+                for e in (m.get("embeds") or []):
+                    for k in ("image", "thumbnail"):
+                        u = ((e.get(k) or {}).get("url")
+                             if isinstance(e.get(k), dict) else e.get(k))
+                        if u:
+                            atts.append({"url": u, "filename": None})
                 slim = {
                     "id": m.get("id"), "ts": m.get("timestamp"),
                     "author": (m.get("author") or {}).get("username", ""),
                     "content": m.get("content") or "",
-                    "attachments": [{"url": a.get("url"), "filename": a.get("filename")}
-                                    for a in (m.get("attachments") or [])],
+                    "embeds": [{"description": e.get("description"),
+                                "fields": [{"name": f.get("name"), "value": f.get("value")}
+                                           for f in (e.get("fields") or [])]}
+                               for e in (m.get("embeds") or [])],
+                    "attachments": atts,
                 }
                 f.write(json.dumps(slim, ensure_ascii=False) + "\n")
                 n += 1

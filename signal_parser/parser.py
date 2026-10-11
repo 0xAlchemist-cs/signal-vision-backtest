@@ -149,6 +149,11 @@ def parse_signal(text: str, image_path: str | None = None,
         out["side"] = str(out["side"]).upper()
     if out.get("order_type"):
         out["order_type"] = str(out["order_type"]).upper()
+    # 条件触发单("4H 收盘跌破 X 才空"): 入场语义是 STOP(向触发方向越过才成交),
+    # 不是 LIMIT — 引擎按 STOP 的触发方向 + 周期收盘确认处理
+    if str(out.get("stop_trigger_type") or "").lower() == "close_based" \
+            and str(out.get("order_type") or "").upper() == "LIMIT":
+        out["order_type"] = "STOP"
     return out
 
 
@@ -160,7 +165,9 @@ if __name__ == "__main__":
     ap.add_argument("--model", default=None)
     args = ap.parse_args()
 
-    if not looks_like_signal(args.text):
+    # 有图必送: 图表型频道 caption 常只有 ticker("XAU"/"scalp"), 文字预筛会
+    # 漏掉全部信号 — 预筛只适用于无图纯文字消息
+    if not args.image and not looks_like_signal(args.text):
         print(json.dumps({"should_trade": False,
                           "intent_family": "skipped_by_pregate"}, ensure_ascii=False))
     else:

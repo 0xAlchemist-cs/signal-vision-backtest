@@ -46,9 +46,10 @@ def _load_env() -> None:
         return
     for line in env.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
 
 
 _load_env()
@@ -80,7 +81,7 @@ DEDUPE_H = 6
 
 
 TICK_OFFSETS = (0, 20_000, 40_000, 59_999)
-_KLINE_HOSTS = {"api.bybit.com", "api.binance.com"}
+_KLINE_HOSTS = {"api.bybit.com", "fapi.binance.com"}
 
 
 def _http_get(url: str, timeout: int = 15):
@@ -152,7 +153,7 @@ class Market:
             time.sleep(0.15)
         binance = set()
         try:
-            data = _http_get("https://api.binance.com/fapi/v1/exchangeInfo")
+            data = _http_get("https://fapi.binance.com/fapi/v1/exchangeInfo")
             for it in data.get("symbols", []):
                 if it.get("quoteAsset") == "USDT" and it.get("contractType") == "PERPETUAL" \
                         and it.get("status") == "TRADING":
@@ -250,7 +251,7 @@ class Market:
         else:
             start = t0_ms
             while start < t1_ms:
-                url = ("https://api.binance.com/fapi/v1/klines"
+                url = ("https://fapi.binance.com/fapi/v1/klines"
                        f"?symbol={sym}&interval=1m&startTime={start}"
                        f"&endTime={t1_ms}&limit=1000")
                 lst = _http_get(url)
@@ -334,7 +335,11 @@ class Market:
         lst = self._load_cur(sym)
         if not lst:
             return []
-        i0 = bisect.bisect_left(lst, t0_ms, key=lambda r: int(r[0]))
+        # t0 向下对齐到分钟 bar: 调用方常传分钟中间的 tick 时间(如 walked_ms),
+        # 直接 bisect 会把"刚成交那一分钟"的整根 bar 排除, 丢失同 bar 内
+        # 尚未处理的 40s/59.999s tick(止损/止盈/管理事件)。调用端以 tms <= t0 过滤已处理 tick。
+        t0_aligned = (t0_ms // 60_000) * 60_000
+        i0 = bisect.bisect_left(lst, t0_aligned, key=lambda r: int(r[0]))
         i1 = bisect.bisect_right(lst, t1_ms, key=lambda r: int(r[0]))
         return lst[i0:i1]
 
@@ -601,7 +606,7 @@ class Sim:
                     # 资金费时点(秒级): 按未平分数与当时名义价值收付
                     fev = pos.get("fev") or []
                     while pos.get("fev_i", 0) < len(fev) and fev[pos["fev_i"]][0] <= tms:
-                        self._apply_funding(pos, fev[pos["fev_i"]][1], price)
+                        self._apply_funding(pos, fev[pos["fev_i"]][1], price, tms)
                         pos["fev_i"] = pos.get("fev_i", 0) + 1
                     pos["walked_ms"] = tms
                     if self._tick_legs(pos, price, tms):
@@ -614,11 +619,12 @@ class Sim:
                 self._finish(pos)
                 positions.pop(pos["base"], None)
 
-    def _apply_funding(self, pos, rate: float, price: float) -> None:
+    def _apply_funding(self, pos, rate: float, price: float, tms: int = 0) -> None:
         is_long = pos["side"] == "LONG"
         delta = 0.0
         for leg in pos["legs"]:
-            if leg["remain_frac"] <= 1e-9:
+            # 未激活腿(限价未成交)没有持仓名义, 不收资金费
+            if leg["remain_frac"] <= 1e-9 or (tms and tms < leg.get("fill_ms", 0)):
                 continue
             qty = (RISK_USDT * leg["risk_share"]) / leg["risk_unit"]
             notional = qty * price * leg["remain_frac"]
@@ -646,7 +652,8 @@ class Sim:
                     tp["done"] = True
                     fill = tp["price"] * (1 - SLIP) if is_long else tp["price"] * (1 + SLIP)
                     for leg in pos["legs"]:
-                        if leg["remain_frac"] <= 1e-9:
+                        # 未激活腿(限价尚未成交)不参与止盈
+                        if leg["remain_frac"] <= 1e-9 or tms < leg.get("fill_ms", 0):
                             continue
                         take = min(tp["frac"], leg["remain_frac"])
                         leg["exits"].append({"price": fill, "frac": take, "ts_ms": tms,
@@ -658,12 +665,20 @@ class Sim:
         for leg in pos["legs"]:
             if leg["remain_frac"] <= 1e-9:
                 continue
+            # 未激活腿: 限价单尚未到成交时间, 不参与止损/止盈/加阶梯 (P0 修复:
+            # 此前第二腿在成交前的 tick 上就可能触发止盈/止损 = 未来数据泄漏)
+            if tms < leg.get("fill_ms", 0):
+                continue
             all_done = False
-            # 1) 止损(硬/保本/收盘条件), 滑点不利
-            stop_eff = leg["stop"] * (1 - SLIP) if is_long else leg["stop"] * (1 + SLIP)
-            breached = (is_long and price <= stop_eff) or (not is_long and price >= stop_eff)
+            # 1) 止损(硬/保本/收盘条件): 触发判定用原始 stop; 滑点只作用于成交价,
+            #    且跳空越过止损时按 tick 价成交(更差者), 不再拿"滑点后价格"倒判触发
+            breached = (is_long and price <= leg["stop"]) or (not is_long and price >= leg["stop"])
             if breached and is_stop_tick:
-                leg["exits"].append({"price": stop_eff, "frac": leg["remain_frac"],
+                if is_long:
+                    fill = min(price, leg["stop"]) * (1 - SLIP)
+                else:
+                    fill = max(price, leg["stop"]) * (1 + SLIP)
+                leg["exits"].append({"price": fill, "frac": leg["remain_frac"],
                                      "ts_ms": tms,
                                      "reason": f"止损@{leg['stop']:g}" + ("收盘" if close_based else "")})
                 leg["remain_frac"] = 0.0
@@ -792,11 +807,17 @@ class Sim:
             px = self.mkt.tick_price_at(old["symbol"], old["source"],
                                         max(sig["ts_ms"], int(old["walked_ms"] or 0)))
             for leg in old["legs"]:
-                if leg["remain_frac"] > 1e-9:
-                    leg["exits"].append({"price": px or leg["entry"],
-                                         "frac": leg["remain_frac"],
-                                         "ts_ms": sig["ts_ms"], "reason": "换新撤旧"})
+                if leg["remain_frac"] <= 1e-9:
+                    continue
+                # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
+                if sig["ts_ms"] < leg.get("fill_ms", 0):
                     leg["remain_frac"] = 0.0
+                    continue
+                leg["exits"].append({"price": px or leg["entry"],
+                                     "frac": leg["remain_frac"],
+                                     "ts_ms": sig["ts_ms"], "reason": "换新撤旧"})
+                leg["remain_frac"] = 0.0
+            old["status"] = "closed"   # 否则报告按 status=="closed" 筛选时漏计
             self._finish(old)
 
         msg_ms = sig["ts_ms"]
@@ -811,7 +832,14 @@ class Sim:
             self._skip(sig, base, side, "无K线数据")
             return
 
-        # 逐腿找成交 tick(市场单=消息后首个 tick; 限价=首次触价)
+        # 逐腿找成交 tick(市场单=消息后首个 tick; 限价=首次触价; STOP=向触发
+        # 方向越过才成交 — "跌破 X 开空" 是 SHORT-STOP(price<=entry 触发),
+        # 与 BUY-LIMIT(price<=entry) 触发方向相反)
+        ot = str(sig.get("order_type") or "").upper()
+        stop_entry = ot == "STOP"
+        # close_based 入场(条件单"4H 收盘跌破 X"): 只在指定周期收盘 tick 判定
+        _tf = str(sig.get("stop_timeframe") or "")
+        stop_tf_min = {"1m": 1, "15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(_tf, 0)
         legs_spec = []
         if market_entry:
             fill_px = fill_tms = None
@@ -832,6 +860,31 @@ class Sim:
                 self._skip(sig, base, side, "开仓即越过止损")
                 return
             legs_spec.append((fill_px, fill_px, fill_tms))
+        elif stop_entry:
+            # STOP 入场: 触发方向与限价相反。LONG-STOP: price>=entry(向上突破);
+            # SHORT-STOP: price<=entry(向下跌破)。close_based 时只在周期收盘 tick 判定
+            for ep in sorted(set(entry_prices), reverse=not is_long):
+                got = None
+                for c in candles:
+                    for tms, price in candle_to_ticks(int(c[0]), float(c[1]), float(c[2]),
+                                                      float(c[3]), float(c[4])):
+                        if tms < msg_ms:
+                            continue
+                        if stop_tf_min and not (tms // 60_000 % stop_tf_min == stop_tf_min - 1
+                                                and tms % 60_000 == 59_999):
+                            continue
+                        hit = ((is_long and price >= ep) or (not is_long and price <= ep))
+                        if hit:
+                            fill = ep * ((1 + SLIP) if is_long else (1 - SLIP))
+                            got = (ep, fill, tms)
+                            break
+                    if got:
+                        break
+                if got:
+                    legs_spec.append(got)
+            if not legs_spec:
+                self._skip(sig, base, side, "STOP未触发")
+                return
         else:
             # "CMP till X"/"CMP and X" 型文字 → 生产 zone_two_legs 双腿
             two_leg = bool(re.search(r"(?i)CMP\s*(?:till|until|&|and)\s*\$?\s*\d",
@@ -924,6 +977,7 @@ class Sim:
                             "msg_id": sig.get("id"), "text": (sig.get("text") or "")[:200]})
 
     def _finish(self, pos) -> None:
+        pos.setdefault("status", "closed")   # 兜底: 换新撤旧等路径可能未显式设置
         r_total = fee_usdt = 0.0
         for leg in pos["legs"]:
             # 名义价值口径: 数量 = 该腿风险金 / 单位风险
@@ -1006,6 +1060,15 @@ def phase_report() -> None:
     total_net = sum(t.get("net_usdt", t.get("pnl_usdt", 0)) for t in closed)
     total_fund = sum(t.get("funding_usdt", 0) for t in closed)
     total_fee = sum(t.get("fee_usdt", 0) for t in closed)
+    if not closed:
+        lines = ["# 影子回测(图解析 + 规则模拟)", "",
+                 f"- 信号: {len(trades)}; 成交平仓 0; 持仓中 {len(open_pos)}",
+                 f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
+                 "- 无已平仓交易, 无胜率/ΣR 统计(避免除零)。", "",
+                 f"- 审计哈希: {json.dumps(_audit_hashes(), ensure_ascii=False)}"]
+        (WORK / "report_v3.md").write_text("\n".join(lines), encoding="utf-8")
+        print("[report] 无已平仓交易, 已输出空报告")
+        return
     seq = sorted(closed, key=lambda x: (x.get("exit_parts") or [{}])[-1].get("ts_ms") or 0)
     cum = peak = dd = 0.0
     for t in seq:

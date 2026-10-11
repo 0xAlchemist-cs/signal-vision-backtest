@@ -1,0 +1,16 @@
+[project]
+name = "signal-vision-backtest"
+version = "0.2.0"
+description = "AI-vision parsing of Discord trading signals + event-driven backtest on 1m OHLC with configurable intrabar path assumption"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+vision = ["requests"]
+fetch = ["pillow"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
