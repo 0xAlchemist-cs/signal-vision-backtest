@@ -203,7 +203,7 @@ def test_low_first_bearish_bar_short_gets_best():
     ve.PATH_MODE = "low_first"
     """low_first 模式(先探低): SHORT 的 TP(低价)先触发 → SHORT 最优。
     (模式名已中性化: low_first/high_first 描述顺序而非'悲观/乐观')"""
-    kl = [[0, 106.0, 108.0, 96.0, 100.0]]   # 同 bar 触及 TP96 与 SL108
+    kl = [[0, 106.0, 109.0, 95.0, 100.0]]   # low95(TP侧) 与 high109(SL侧) 同 bar
     evs = [{"ts_ms": 1_000, "kind": "signal", "side": "SELL",
             "entry": None, "sl": 108.0, "tp": 96.0}]
     cfg = ve.Config(r_action="none", sizing="fixed", lots_fixed=0.01)
