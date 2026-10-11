@@ -5,7 +5,7 @@ description = "AI-vision parsing of Discord trading signals + event-driven backt
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+dependencies = ["requests"]
 
 [project.optional-dependencies]
 vision = ["requests"]

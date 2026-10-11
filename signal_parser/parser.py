@@ -149,11 +149,16 @@ def parse_signal(text: str, image_path: str | None = None,
         out["side"] = str(out["side"]).upper()
     if out.get("order_type"):
         out["order_type"] = str(out["order_type"]).upper()
-    # 条件触发单("4H 收盘跌破 X 才空"): 入场语义是 STOP(向触发方向越过才成交),
-    # 不是 LIMIT — 引擎按 STOP 的触发方向 + 周期收盘确认处理
-    if str(out.get("stop_trigger_type") or "").lower() == "close_based" \
-            and str(out.get("order_type") or "").upper() == "LIMIT":
-        out["order_type"] = "STOP"
+    # 入场触发语义与止损触发语义是两个独立概念(v0.2.1 修正: 不得根据止损
+    # 规则擅自修改开仓类型)。条件入场("4H 收盘跌破 X 才空")由 conditional
+    # 字段驱动, 输出 entry_trigger_type 供引擎区分 intrabar/close_based。
+    if out.get("conditional") and (out.get("entry_prices") or out.get("entry_price")):
+        txt = str(out.get("text") or "")
+        out.setdefault("entry_trigger_type",
+                       "close_based" if re.search(r"(?i)close\s*(under|below|above|over)|收盘", txt)
+                       else "intrabar")
+        m_tf = re.search(r"(?i)\b(4H|1H|1D|15m|2H|6H|12H)\b", txt)
+        out.setdefault("entry_timeframe", m_tf.group(1) if m_tf else None)
     return out
 
 

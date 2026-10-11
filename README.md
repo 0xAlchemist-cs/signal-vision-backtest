@@ -330,6 +330,14 @@ python -m backtest.voice_event_engine \
 - **P1**：.env 解析条件反转；Binance Futures 域名改为 fapi.binance.com；报告除零；信号解析"有图必送"；示例 JSON 空单方向；`python -m signal_parser` 入口
 - 新增回归测试（tests/）与 CI
 
+## v0.2.2 修复记录（第二轮外部审查回应）
+
+- **P0-1**：撤销"close_based 止损 → STOP 入场"的错误映射——止损触发语义与开仓订单类型是两个独立概念；条件入场改由独立的 `entry_trigger_type`/`entry_timeframe` 字段承载
+- **P0-2**：STOP 入场的滑点成交价进入记账（entry/risk_unit/手续费/R 全部按实际成交价）
+- **P0-3**：voice 引擎重写为 PENDING/FILLED 状态机——限价单成交前不可被管理动作平仓、成交前的 close_all=撤单、参考价严格取已完成 bar
+- **P0-4**：`SVB_PATH_MODE=synthetic|worst|best` 三种分钟内路径假设 + 同 bar TP/SL 冲突分钟计数进报告
+- **P1**：撤单腿不再收开仓手续费；BE=已成交腿**实际数量**加权均价（等风险≠等数量）；资金费缺失标的进报告数据质量行；测试重写为真实撮合路径的集成测试（FakeMarket+完整状态机），CI 增加干净安装 smoke
+
 ## License
 
 MIT

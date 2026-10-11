@@ -102,10 +102,24 @@ def _http_get(url: str, timeout: int = 15):
     raise RuntimeError(f"重试耗尽: {url}")
 
 
+PATH_MODE = os.getenv("SVB_PATH_MODE", "synthetic")   # synthetic | worst | best
+
+
 def candle_to_ticks(ts_ms, o, h, l, c):
-    bull = c >= o
-    first = l if bull else h
-    second = h if bull else l
+    """1m OHLC → 4 合成 tick。
+
+    synthetic: 阳线先探低后探高, 阴线反之 (原版假设)。
+    worst/best: 强制 先探低后探高 / 先探高后探低 — 对 LONG 前者悲观、
+    后者乐观; 对 SHORT 相反。同一根 bar 内 TP 与 SL 均被触及的分钟,
+    三种模型会给出不同结果 — 报告的 tp_sl_conflicts 计数标示此类分钟的量。"""
+    if PATH_MODE == "worst":
+        first, second = l, h
+    elif PATH_MODE == "best":
+        first, second = h, l
+    else:
+        bull = c >= o
+        first = l if bull else h
+        second = h if bull else l
     return [(ts_ms + TICK_OFFSETS[0], o), (ts_ms + TICK_OFFSETS[1], first),
             (ts_ms + TICK_OFFSETS[2], second), (ts_ms + TICK_OFFSETS[3], c)]
 
@@ -408,9 +422,10 @@ def _slip_price(price: float, side: str, is_long: bool, adverse: bool) -> float:
 
 
 class Sim:
-    def __init__(self, rule: str = "r_ladder"):
-        self.mkt = Market()
+    def __init__(self, rule: str = "r_ladder", mkt: "Market | None" = None):
+        self.mkt = mkt if mkt is not None else Market()
         self.trades: list = []
+        self.funding_missing: set = set()   # P1-7: 资金费数据缺失的标的
         self.rule = rule          # r_ladder(R-ladder) | tp_ladder(信号止盈位均分)
         self._fund_cache: dict[str, list] = {}   # sym -> [[ts,rate],...] 升序
 
@@ -477,6 +492,7 @@ class Sim:
             except Exception as e:
                 print(f"[funding] {sym} 获取失败(按无资金费处理): {e}")
                 got = []
+                self.funding_missing.add(sym)
             if got:
                 rows = sorted({int(r[0]): r for r in (rows + got)}.values(), key=lambda x: x[0])
                 tmp = f.with_suffix(".tmp")
@@ -591,6 +607,8 @@ class Sim:
             pi = 0
             closed = False
             for c in self.mkt.candles(pos["symbol"], t0, t1):
+                bar_hi, bar_lo = float(c[2]), float(c[3])
+                tp_hit_this_bar = False
                 for tms, price in candle_to_ticks(int(c[0]), float(c[1]),
                                                   float(c[2]), float(c[3]), float(c[4])):
                     if tms <= t0 or tms > t1:
@@ -612,6 +630,16 @@ class Sim:
                     if self._tick_legs(pos, price, tms):
                         closed = True
                         break
+                # 同 bar TP/SL 冲突统计: 本 bar 触发了 TP, 且 bar 范围也覆盖止损
+                if pos.get("_tp_hit_ms") is not None                         and any((is_long and bar_lo <= l["stop"]) or
+                                (not is_long and bar_hi >= l["stop"])
+                                for l in pos["legs"] if l["remain_frac"] > 1e-9):
+                    is_long_c = pos["side"] == "LONG"
+                    if any((is_long_c and bar_lo <= l["stop"] <= bar_hi) or
+                           (not is_long_c and bar_lo <= l["stop"] <= bar_hi)
+                           for l in pos["legs"] if l["remain_frac"] > 1e-9):
+                        pos["tp_sl_conflicts"] = pos.get("tp_sl_conflicts", 0) + 1
+                    pos["_tp_hit_ms"] = None
                 if closed or pos.get("force_closed"):
                     break
             if pos["remain_total"] <= 1e-9 or pos.get("force_closed"):
@@ -650,6 +678,7 @@ class Sim:
                     continue
                 if (is_long and price >= tp["price"]) or (not is_long and price <= tp["price"]):
                     tp["done"] = True
+                    pos["_tp_hit_ms"] = tms
                     fill = tp["price"] * (1 - SLIP) if is_long else tp["price"] * (1 + SLIP)
                     for leg in pos["legs"]:
                         # 未激活腿(限价尚未成交)不参与止盈
@@ -721,13 +750,21 @@ class Sim:
     # ---- 管理消息(秒级, 成交=消息后首个 tick 价) ----
 
     def _apply_manage(self, pos, mg, tick_price) -> None:
+        # 管理消息语义(v0.2.2 修正): 执行价 = **消息时刻**的行情价(而非补执行
+        # 时刻的价格); 只作用于消息时刻已成交的腿(限价未成交的腿保持原始止损,
+        # 其后如需 BE 由交易员再喊)。修复"成交前管理被延迟到成交后补执行"的
+        # 时间错位(实测部分止盈被记在未成交腿上)。
+        mg_px = self.mkt.tick_price_at(pos["symbol"], pos["source"],
+                                       mg["ts_ms"]) or tick_price
+        tick_price = mg_px
+        mg_ts = mg["ts_ms"]
         item = mg["item"]
         params = item.get("params") or {}
         action = str(params.get("action_type") or params.get("action") or "")
         is_long = pos["side"] == "LONG"
         if action in ("CLOSE_ALL", "closed", "stopped_out", "stopped_be"):
             for leg in pos["legs"]:
-                if leg["remain_frac"] > 1e-9:
+                if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
                     fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
                     leg["exits"].append({"price": fill, "frac": leg["remain_frac"],
                                          "ts_ms": mg["ts_ms"], "reason": "喊单全平"})
@@ -740,19 +777,23 @@ class Sim:
             new_stop = (params.get("stop_price") or params.get("new_stop")
                         or params.get("new_sl"))
             mult = pos["mult"]
-            # BE 语义(v0.2.1 修正): 交易员喊"移保本" = 已成交腿的加权均价。
-            # DCA 格式频道(Entry+Dca 双档)实证: 用 DCA 价或首腿价当保本会把
-            # 盈利单系统性算亏(独立审计三案例全部由亏转盈)。仅首腿成交时
-            # 加权均价 == 首腿价, 兼容单入场旧口径。
+            # BE 语义(v0.2.2 修正): 交易员喊"移保本" = **消息时刻已成交腿**的
+            # 实际数量加权均价 P=Σ(Pi·Qi)/ΣQi, Qi=RISK·share_i/risk_unit_i —
+            # 等风险不等于等数量(止损近的腿数量大); 未成交腿不计入, 其后如需
+            # BE 由交易员再喊。DCA 格式频道实证: 用 DCA 价或首腿价当保本会把
+            # 盈利单系统性算亏(独立审计三案例全部由亏转盈)。
+            mg_ts = mg["ts_ms"]
             if new_stop:
                 ns = float(new_stop) * mult
             else:
-                _w = sum(l["risk_share"] for l in pos["legs"]) or 1.0
-                ns = sum(l["entry"] * l["risk_share"] for l in pos["legs"]) / _w
+                _live = [l for l in pos["legs"] if mg_ts >= l.get("fill_ms", 0)]
+                _w = sum((RISK_USDT * l["risk_share"]) / l["risk_unit"] for l in _live) or 1.0
+                ns = sum(l["entry"] * (RISK_USDT * l["risk_share"]) / l["risk_unit"]
+                         for l in _live) / _w
             eff = ns * ((1 - SLIP) if is_long else (1 + SLIP))
             if (is_long and eff >= tick_price) or (not is_long and eff <= tick_price):
                 for leg in pos["legs"]:
-                    if leg["remain_frac"] > 1e-9:
+                    if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
                         fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
                         leg["exits"].append({"price": fill, "frac": leg["remain_frac"],
                                              "ts_ms": mg["ts_ms"], "reason": "移损越价即平"})
@@ -761,12 +802,14 @@ class Sim:
                 pos["force_closed"] = True
             else:
                 for leg in pos["legs"]:
-                    leg["stop"] = ns
+                    # 未成交腿不受 BE 影响: 成交时它还带着原始止损
+                    if mg_ts >= leg.get("fill_ms", 0):
+                        leg["stop"] = ns
         elif action in ("PARTIAL_TP", "partial"):
             pct = min(float(params.get("percent") or 50) / 100.0, 1.0)
             fill = tick_price * ((1 - SLIP) if is_long else (1 + SLIP))
             for leg in pos["legs"]:
-                if leg["remain_frac"] > 1e-9:
+                if leg["remain_frac"] > 1e-9 and mg_ts >= leg.get("fill_ms", 0):
                     frac = min(pct, leg["remain_frac"])
                     leg["exits"].append({"price": fill, "frac": frac, "ts_ms": mg["ts_ms"],
                                          "reason": f"喊单止盈{params.get('percent', 50):g}%"})
@@ -940,10 +983,12 @@ class Sim:
         legs = []
         first_fill_ms = min(sp[2] for sp in legs_spec)
         for ep, fpx, ftms in legs_spec:
-            risk_unit = abs(ep - sl)
+            # P0 修复: entry/risk_unit 用**实际成交价** fpx(市价/STOP 含滑点),
+            # 而非触发价 ep — 否则止损距离、仓位、手续费与 R 全部失真
+            risk_unit = abs(fpx - sl)
             if risk_unit <= 0:
                 continue
-            legs.append({"entry": ep, "risk_unit": risk_unit, "risk_share": 1.0 / n,
+            legs.append({"entry": fpx, "risk_unit": risk_unit, "risk_share": 1.0 / n,
                          "remain_frac": 1.0, "stop": sl, "t1_done": False,
                          "t2_done": False, "fill_ms": ftms, "exits": []})
         if not legs:
@@ -990,7 +1035,12 @@ class Sim:
         for leg in pos["legs"]:
             # 名义价值口径: 数量 = 该腿风险金 / 单位风险
             qty = (RISK_USDT * leg["risk_share"]) / leg["risk_unit"]
-            fee_usdt += qty * leg["entry"] * FEE_RATE
+            # P1 修复: 未成交即被撤单的腿(fill_ms 在撤单之后)没有开仓, 不收
+            # 开仓手续费; 出场费只按真实出场记录计
+            cancelled_before_fill = (leg["fill_ms"] > max(
+                (e["ts_ms"] for e in leg["exits"] if e.get("ts_ms")), default=0))
+            if not cancelled_before_fill:
+                fee_usdt += qty * leg["entry"] * FEE_RATE
             for ep in leg["exits"]:
                 move = ((ep["price"] - leg["entry"]) if pos["side"] == "LONG"
                         else (leg["entry"] - ep["price"]))
@@ -1041,6 +1091,8 @@ def phase_sim() -> None:
     sim.run(signals, manages)
     (WORK / "trades.json").write_text(json.dumps(sim.trades, ensure_ascii=False),
                                       encoding="utf-8")
+    (WORK / "funding_quality.json").write_text(json.dumps(
+        {"missing_symbols": sorted(sim.funding_missing)}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
 
 
@@ -1058,6 +1110,10 @@ def phase_report() -> None:
     trades = json.loads((WORK / "trades.json").read_text(encoding="utf-8"))
     closed = [t for t in trades if t.get("status") == "closed" and t.get("r") is not None]
     open_pos = [t for t in trades if t.get("status") == "open"]
+    fq = {}
+    fq_path = WORK / "funding_quality.json"
+    if fq_path.exists():
+        fq = json.loads(fq_path.read_text(encoding="utf-8"))
     skipped: dict[str, int] = {}
     for t in trades:
         st = t.get("status")
@@ -1072,6 +1128,8 @@ def phase_report() -> None:
         lines = ["# 影子回测(图解析 + 规则模拟)", "",
                  f"- 信号: {len(trades)}; 成交平仓 0; 持仓中 {len(open_pos)}",
                  f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
+                 f"- 数据质量: 资金费缺失标的 {fq.get('missing_symbols') or '无'}"
+                 f" (路径模式 {PATH_MODE})",
                  "- 无已平仓交易, 无胜率/ΣR 统计(避免除零)。", "",
                  f"- 审计哈希: {json.dumps(_audit_hashes(), ensure_ascii=False)}"]
         (WORK / "report_v3.md").write_text("\n".join(lines), encoding="utf-8")

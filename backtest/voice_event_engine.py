@@ -8,22 +8,27 @@ signals that invalidate the previous position.
 Input contract (JSON files):
   events : list of {"ts_ms": int, "kind": "signal"|"manage"|"noise", ...}
       signal -> {"side": "BUY"|"SELL", "entry": float|None, "sl": float, "tp": float}
-                entry=None means market-style alert (only SL/TP given):
-                fill at the close of the first 1m bar after the message.
+                entry=None means market-style alert: filled at the close of the
+                first COMPLETED 1m bar after the message (fill time = bar end).
       manage -> {"ev": "secure_profit"|"be_set"|"close_all"}
   klines : list of [ts_ms, open, high, low, close] 1m bars, single symbol.
 
+Order state machine (v0.2.2 — fixes look-ahead & premature fills):
+  LIMIT orders live in a PENDING state from the message until the first bar
+  whose range touches the entry; only then do they become FILLED positions.
+  * manage events before the fill are ignored, EXCEPT close_all which cancels
+    the pending order (no PnL — an order that never filled cannot close);
+  * the position is managed only from its fill bar's close onward;
+  * the reference price for guards/quotes is the close of the last COMPLETED
+    bar before the message (never the current forming bar's close).
+
 Knobs (see Dataclass Config):
-  r_action        what happens when price reaches +1R:
-                  "flat" (close all) | "half_be" (close half + stop to entry)
-                  | "be_only" (stop to entry) | "none"
-  sizing          "fixed" lots_fixed | "risk" risk_per_trade / stop distance,
-                  clamped to [min_lots, max_lots]
-  on_new_signal   "close_and_open" (any new signal flattens the old pos)
-                  | "ignore_same_dir" (only opposite side flattens)
+  r_action        "flat" | "half_be" | "be_only" | "none"   (what happens at +1R)
+  sizing          "fixed" lots_fixed | "risk" risk_per_trade / stop distance
+  on_new_signal   "close_and_open" | "ignore_same_dir"
   entry_timeout_min  pending limit orders older than this are dropped
   price_guard_pct    reject signals whose entry/sl/tp deviates more than this
-                     from the bar close at signal time (parse-error guard)
+                     from the last known price at signal time
 
 Match rules (deliberately conservative):
   * within one 1m bar, SL is checked BEFORE the +1R trigger and TP;
@@ -69,6 +74,16 @@ def run(kl, evs, cfg: Config):
     legs = []
     pos = None
 
+    def known_price(ts: int) -> float:
+        """最后一个**已完成** bar 的收盘: 消息所在分钟的前一根 bar。
+        消息 10:00:15 → 10:00 bar 10:01 才收盘, 不可用; 09:59 收盘可知。
+        消息早于全部 bar 时退化为首根 bar 的开盘价(开盘即已知)。"""
+        minute_start = (ts // 60_000) * 60_000
+        j = bisect_left(starts, minute_start) - 1
+        if j >= 0:
+            return kl[j][4]
+        return kl[0][1] if kl and starts[0] <= ts else None
+
     def close_part(px, oz, ts, reason):
         nonlocal equity, pos
         d = 1 if pos["side"] == "BUY" else -1
@@ -82,7 +97,30 @@ def run(kl, evs, cfg: Config):
 
     for e in evs:
         ts = e["ts_ms"]
-        # --- advance bars up to this event: SL / TP / +1R triggers ---
+        # --- 推进 PENDING 限价单: 扫描到当前事件为止是否触及入场 ---
+        if pos and pos.get("pending"):
+            n_end = bisect_left(starts, ts)          # 开盘时间 < ts 的 bar
+            n = pos["entry_search_from"]
+            filled = False
+            while n < n_end:
+                b = kl[n]
+                if b[3] <= pos["entry"] <= b[2]:
+                    # 成交 → 转 FILLED, 管理从该 bar 收盘之后开始
+                    pos["pending"] = False
+                    pos["fill_ts"] = starts[n] + 59_999
+                    pos["lw"] = pos["fill_ts"]
+                    pos["entry_search_from"] = n + 1
+                    filled = True
+                    break
+                n += 1
+            pos["entry_search_from"] = max(pos["entry_search_from"], n_end)
+            if pos.get("pending"):
+                # 仍未成交: close_all/取消 → 撤单(无盈亏); 其余管理无仓位可作用
+                if e.get("kind") == "manage" and e.get("ev") == "close_all":
+                    pos = None
+                continue
+
+        # --- 推进 FILLED 持仓: SL / TP / 1R 判定 ---
         if pos:
             d = 1 if pos["side"] == "BUY" else -1
             i0 = bisect_left(starts, pos["lw"])
@@ -114,13 +152,15 @@ def run(kl, evs, cfg: Config):
                             pos["r1_done"] = True
             if pos:
                 pos["lw"] = ts
-        # --- trader voice actions ---
+
+        # --- 交易员喊话 (只作用于已成交仓位, 且喊话时刻在成交之后) ---
         kind = e.get("kind")
-        if kind == "manage" and pos:
-            ev, i = e.get("ev"), bisect_left(starts, ts)
-            if i >= len(kl):
+        if kind == "manage" and pos and not pos.get("pending") \
+                and ts > pos.get("fill_ts", 0):
+            ev = e.get("ev")
+            px = known_price(ts)
+            if px is None:
                 continue
-            px = kl[i][4]
             if ev == "close_all":
                 close_part(px, pos["qty"], ts, "close_all_call")
             elif ev == "secure_profit" and cfg.secure_profit_half:
@@ -133,7 +173,7 @@ def run(kl, evs, cfg: Config):
             elif ev == "be_set" and not pos.get("be"):
                 pos["sl"] = pos["entry"]
                 pos["be"] = True
-        # --- new signals ---
+        # --- 新信号 ---
         elif kind == "signal":
             side = e.get("side")
             if side not in ("BUY", "SELL"):
@@ -145,30 +185,32 @@ def run(kl, evs, cfg: Config):
             i = bisect_left(starts, ts)
             if i >= len(kl):
                 continue
-            # 参考价(护栏/缺省入场) = 消息时刻**之前**最后一根已完成 bar 的收盘。
-            # 修复前视偏差: 旧实现 bisect_left 直接取下一根 bar 的收盘(未来价)。
-            j = i - 1
-            ref = kl[j][4] if j >= 0 else None
+            # 参考价 = 消息所在分钟**之前**最后一根已完成 bar 的收盘 (v0.2.2:
+            # 旧实现取下一根 bar 收盘 = 未来价)
+            ref = known_price(ts)
             if ref is None:
                 continue
             if entry is not None and (entry <= 0 or abs(entry - ref) / ref > cfg.price_guard_pct):
                 continue
-            # fill: limit touch within window, else next completed bar close for
-            # market-style alerts (fill time = that bar's close, no look-ahead)
+            # 成交: 限价 = 之后首根触及 bar (PENDING); 市价型 = 消息所在分钟的
+            # 收盘 (该分钟收盘是消息后第一个可知的 bar 收盘价, fill 时点 = 分钟末)
             fill = None
             fill_bar_ts = None
+            pending = False
             if entry is not None:
                 for n in range(i, min(i + cfg.entry_timeout_min, len(kl))):
                     b = kl[n]
                     if b[3] <= entry <= b[2]:
                         fill = entry
                         fill_bar_ts = b[0]
+                        pending = True       # 触及可能发生在 bar 内任意时刻
                         break
             else:
-                if i >= len(kl):
-                    continue
-                fill = kl[i][4]          # 消息后首根完整 bar 的收盘
-                fill_bar_ts = kl[i][0]
+                mi = i - 1                   # 消息所在分钟 bar (starts[i] > ts 时)
+                if mi < 0:
+                    mi = 0                   # 消息在首根 bar 分钟内 → 该 bar 收盘成交
+                fill = kl[mi][4]
+                fill_bar_ts = kl[mi][0]
             if fill is None:
                 continue
             if any(v <= 0 or abs(v - ref) / ref > cfg.price_guard_pct for v in (fill, sl, tp)):
@@ -176,25 +218,60 @@ def run(kl, evs, cfg: Config):
             unit = abs(fill - sl)
             if unit <= 0 or (sl - fill) * d >= 0 or (fill - tp) * d >= 0:
                 continue
-            # new signal vs open position
+            # 新信号 vs 现有仓位(含 PENDING 挂单: 换新 = 撤旧单, 无盈亏)
             if pos:
-                if cfg.on_new_signal == "ignore_same_dir" and pos["side"] == side:
+                if cfg.on_new_signal == "ignore_same_dir" and pos["side"] == side \
+                        and not pos.get("pending"):
                     continue
-                close_part(ref, pos["qty"], ts, "signal_flip")
+                if pos.get("pending"):
+                    pos = None               # 撤旧挂单
+                else:
+                    close_part(ref, pos["qty"], ts, "signal_flip")
             if cfg.sizing == "risk":
                 lots = min(cfg.max_lots, max(cfg.min_lots,
                                                 math.floor(cfg.risk_per_trade / unit) / 100.0))
             else:
                 lots = cfg.lots_fixed
-            # lw: 持仓管理起点 = 成交 bar 的收盘 tick。修复前视偏差: 旧实现用
-            # 消息 ts, 限价腿会在"成交前的时段"就被止损/止盈判定(未来管理)。
             pos = {"side": side, "entry": fill, "qty": round(lots * cfg.oz_per_lot, 2),
                    "sl": sl, "tp": tp, "unit": unit, "open_ts": ts,
-                   "lw": fill_bar_ts + 59_999,
+                   "lw": fill_bar_ts + 59_999 if not pending else 0,
+                   "fill_ts": fill_bar_ts + 59_999 if not pending else None,
+                   "pending": pending,
+                   "entry_search_from": i if pending else 0,
                    "be": False, "r1_done": False}
 
     if pos:
-        close_part(kl[-1][4], pos["qty"], kl[-1][0], "end_of_data")
+        if pos.get("pending"):
+            # 事件流结束后, PENDING 挂单仍可能在其后被触及 → 扫描到数据末尾,
+            # 成交则转 FILLED 并继续走查 SL/TP, 未成交则撤单(无盈亏)
+            n = pos["entry_search_from"]
+            while n < len(kl):
+                b = kl[n]
+                if b[3] <= pos["entry"] <= b[2]:
+                    pos["pending"] = False
+                    pos["fill_ts"] = starts[n] + 59_999
+                    pos["lw"] = pos["fill_ts"]
+                    break
+                n += 1
+        if pos and not pos.get("pending"):
+            d = 1 if pos["side"] == "BUY" else -1
+            i0 = bisect_left(starts, pos["lw"])
+            done = False
+            for n in range(i0, len(kl)):
+                b = kl[n]
+                if (b[3] <= pos["sl"]) if d == 1 else (b[2] >= pos["sl"]):
+                    close_part(pos["sl"], pos["qty"], b[0],
+                               "BE" if pos.get("be") else "SL")
+                    done = True
+                    break
+                if pos["tp"] and ((b[2] >= pos["tp"]) if d == 1 else (b[3] <= pos["tp"])):
+                    close_part(pos["tp"], pos["qty"], b[0], "TP")
+                    done = True
+                    break
+            if not done:
+                close_part(kl[-1][4], pos["qty"], kl[-1][0], "end_of_data")
+        else:
+            pos = None                # 到期未成交, 撤单
 
     wins = sum(1 for t in legs if t["pnl"] > 0)
     total = round(sum(t["pnl"] for t in legs), 2)
