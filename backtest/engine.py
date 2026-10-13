@@ -1041,44 +1041,53 @@ class Sim:
                 self._skip(sig, base, side, "48h未成交")
                 return
 
+        # 逐腿方向校验 (审查八/九): 先过滤无效腿, 再统一计算 first_fill_ms /
+        # TP 参考价 / 风险份额 — 被剔除腿不得污染时间与价格参考
+        # (LONG 成交价必须高于止损, SHORT 反之; abs() 会把越止损的腿
+        # 伪装成正常风险距离)
+        legs_spec = [sp for sp in legs_spec
+                     if abs(sp[1] - sl) > 0
+                     and ((is_long and sp[1] > sl) or (not is_long and sp[1] < sl))]
+        if not legs_spec:
+            self._skip(sig, base, side, "无有效入场腿(成交价越过止损)")
+            return
         n = len(legs_spec)
         legs = []
         first_fill_ms = min(sp[2] for sp in legs_spec)
         for ep, fpx, ftms in legs_spec:
-            # P0 修复: entry/risk_unit 用**实际成交价** fpx(市价/STOP 含滑点),
+            # entry/risk_unit 用**实际成交价** fpx(市价/STOP 含滑点),
             # 而非触发价 ep — 否则止损距离、仓位、手续费与 R 全部失真
-            # 逐腿方向校验 (审查八): LONG 成交价必须高于止损, SHORT 反之 —
-            # 平均价校验+abs() 会把"腿价已越过止损"伪装成正常风险距离
             risk_unit = abs(fpx - sl)
-            if risk_unit <= 0 or (is_long and fpx <= sl) or (not is_long and fpx >= sl):
-                continue
             legs.append({"entry": fpx, "risk_unit": risk_unit, "risk_share": 1.0 / n,
                          "remain_frac": 1.0, "stop": sl, "t1_done": False,
                          "t2_done": False, "fill_ms": ftms, "exits": []})
-        if not legs:
-            self._skip(sig, base, side, "无有效入场腿(成交价越过止损)")
-            return
         # 换仓契约 (审查八): replace_on_fill — 新信号**实际成交**后才撤旧换新;
         # 未成交的新信号(STOP未触发/LIMIT未成交/无有效腿)不影响旧仓。
-        # 旧实现在撮合之前先撤旧仓, 新单未成交也把旧仓系统性提前平掉
+        # 时间因果 (审计九): 先把旧仓**正常推进**到新单首个有效成交时刻 —
+        # 等待期间的止损/止盈/管理指令照常生效; 旧仓若已离场则无需换新,
+        # 仍有剩余才按换新撤旧在该时刻结算, 不得用未来价格倒填当前状态
         if base in positions:
             old = positions.pop(base)
-            px = self.mkt.tick_price_at(old["symbol"], old["source"],
-                                        max(first_fill_ms, int(old["walked_ms"] or 0)))
-            for leg in old["legs"]:
-                if leg["remain_frac"] <= 1e-9:
-                    continue
-                # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
-                if first_fill_ms < leg.get("fill_ms", 0):
+            _tmp = {base: old}
+            self._advance_all(_tmp, first_fill_ms)
+            old = _tmp.get(base)
+            if old is not None:
+                px = self.mkt.tick_price_at(old["symbol"], old["source"],
+                                            max(first_fill_ms, int(old["walked_ms"] or 0)))
+                for leg in old["legs"]:
+                    if leg["remain_frac"] <= 1e-9:
+                        continue
+                    # 未激活腿(限价未成交)按撤单处理: 无成交即无盈亏
+                    if first_fill_ms < leg.get("fill_ms", 0):
+                        leg["remain_frac"] = 0.0
+                        leg["cancelled_before_fill"] = True   # 显式标记 → _finish 不收开仓费
+                        continue
+                    leg["exits"].append({"price": px or leg["entry"],
+                                         "frac": leg["remain_frac"],
+                                         "ts_ms": first_fill_ms, "reason": "换新撤旧"})
                     leg["remain_frac"] = 0.0
-                    leg["cancelled_before_fill"] = True   # 显式标记 → _finish 不收开仓费
-                    continue
-                leg["exits"].append({"price": px or leg["entry"],
-                                     "frac": leg["remain_frac"],
-                                     "ts_ms": first_fill_ms, "reason": "换新撤旧"})
-                leg["remain_frac"] = 0.0
-            old["status"] = "closed"   # 否则报告按 status=="closed" 筛选时漏计
-            self._finish(old)
+                old["status"] = "closed"   # 否则报告按 status=="closed" 筛选时漏计
+                self._finish(old)
         # tp_ladder 规则: 信号自带的止盈位(图读或文字), 每档平 1/N
         # hybrid(2026-09-28): 同样构建 TP 阶梯——+R1 平 F1+保本后, 剩余跟此阶梯+喊单
         tp_ladder = []

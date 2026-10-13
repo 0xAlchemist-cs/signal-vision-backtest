@@ -116,7 +116,10 @@ def test_voice_event_limit_no_pnl_before_fill():
     res = ve.run(kl, evs, cfg)
     assert len(res["legs"]) == 1
     assert res["legs"][0]["reason"] == "SL"
-    assert res["legs"][0]["exit"] == 95.0, "BE 喊话在成交前, 止损应保持原始 95"
+    # 止损保持原始 95(未被 BE 移到 105); bar3 low 94.5 穿越止损 →
+    # 审计九跳空规则: 成交 = min(现价, 止损)×(1-滑点)
+    assert res["legs"][0]["exit"] == pytest.approx(94.5 * (1 - ve.SLIP)), \
+        "BE 喊话在成交前, 止损应保持原始 95; 跳空按更差可执行价成交"
 
 
 # ---------------------------------------------------------------------------

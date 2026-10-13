@@ -65,6 +65,7 @@ class Config:
 
 
 PATH_MODE = os.getenv("VE_PATH_MODE", "synthetic")   # synthetic | low_first | high_first
+SLIP = float(os.getenv("SVB_SLIP", "0.0005"))   # 与主引擎同源: 止损跳空按更差的可执行价+滑点
 TICK_OFFSETS = (0, 20_000, 40_000, 59_999)
 
 
@@ -187,7 +188,11 @@ def run(kl, evs, cfg: Config):
                     if tms <= pos["lw"]:
                         continue
                     if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
-                        close_part(pos["sl"], pos["qty"], tms,
+                        # 跳空止损 (审计九): 成交 = min/max(现价, 止损) 再加滑点 —
+                        # 与主引擎同规则, 行情越过止损时按更差的可执行价成交
+                        gap = min(price, pos["sl"]) if d == 1 else max(price, pos["sl"])
+                        close_part(gap * ((1 - SLIP) if d == 1 else (1 + SLIP)),
+                                   pos["qty"], tms,
                                    "BE" if pos.get("be") else "SL")
                         done = True
                         break
@@ -354,7 +359,11 @@ def run(kl, evs, cfg: Config):
                     if tms <= pos["lw"]:
                         continue
                     if (price <= pos["sl"]) if d == 1 else (price >= pos["sl"]):
-                        close_part(pos["sl"], pos["qty"], tms,
+                        # 跳空止损 (审计九): 成交 = min/max(现价, 止损) 再加滑点 —
+                        # 与主引擎同规则, 行情越过止损时按更差的可执行价成交
+                        gap = min(price, pos["sl"]) if d == 1 else max(price, pos["sl"])
+                        close_part(gap * ((1 - SLIP) if d == 1 else (1 + SLIP)),
+                                   pos["qty"], tms,
                                    "BE" if pos.get("be") else "SL")
                         done = True
                         break

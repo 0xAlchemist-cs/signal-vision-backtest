@@ -216,6 +216,7 @@ def test_low_first_bearish_bar_short_gets_best():
     # low_first: 80s tick 探低 94 → TP@94 先触发, SHORT 盈利 (+6)
     assert outcomes["low_first"] == ("TP", pytest.approx(94.0)), outcomes
     # high_first 与 synthetic(阴线默认先探高): 80s tick 探高 108 → SL@108
-    assert outcomes["high_first"] == ("SL", pytest.approx(108.0)), outcomes
-    assert outcomes["synthetic"] == ("SL", pytest.approx(108.0)), \
+    # (审计九跳空规则: SL 成交 = max(现价,止损)×(1+滑点), 恰触时=止损×(1+滑点))
+    assert outcomes["high_first"] == ("SL", pytest.approx(108.0 * (1 + ve.SLIP))), outcomes
+    assert outcomes["synthetic"] == ("SL", pytest.approx(108.0 * (1 + ve.SLIP))), \
         f"阴线 synthetic 默认先探高, 实际 {outcomes['synthetic']}"

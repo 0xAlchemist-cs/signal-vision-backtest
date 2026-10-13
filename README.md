@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-62%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-67%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -405,6 +405,15 @@ python -m backtest.voice_event_engine \
 - **P1（数量守恒）**：R 阶梯出场 `take = min(配置比例, 当前剩余)`——GR 环境变量可配置（如 70%+70%），旧实现会记录 140% 的出场数量使 remain_frac 变负
 - **P2（voice ignore_same_dir 契约明示）**：只保护**已成交持仓**（同向新信号忽略）；同向**未成交挂单**（含 WAITING_FILL）始终允许换新。契约写入 Config 注释，两侧行为均有钉住测试
 - 回归测试 54 → 62 个（第八轮 8 条：6 红 2 绿钉住）
+
+## v0.2.10 修复记录（第九轮审计回应）
+
+主题：历史事件的时间因果关系。5 条新测试全部先红后绿（5/5 在旧代码复现故障）。
+
+- **P0（replace_on_fill 时间因果）**：撤旧换新前先把旧仓**正常推进**到新单首个有效成交时刻——等待期间的止损/止盈/管理指令照常生效；旧仓若已离场（如先触发止损）则无需换新，仍有剩余才在该时刻按换新撤旧结算。旧实现用**未来成交时刻的价格与时间**直接结算旧仓，等待期内的止损被跳过、出场记录落在未来（时间倒置）
+- **P1（无效腿数据依赖）**：逐腿方向过滤**先于** first_fill_ms / TP 参考价 / 风险份额的计算——被剔除的越止损腿不再污染开仓时间与 TP 初始化。旧实现下"无效腿 92 先触发、有效腿 100 后成交、TP 98"会让有效腿在 98 被"止盈"出亏损单；风险份额现重算到有效腿（契约：剔除后重新分配）
+- **P1（voice 跳空止损）**：与主引擎统一——成交 = min/max(现价, 止损) 再加滑点（LONG 取更低价、SHORT 取更高价），SVB_SLIP 同源（默认 0.0005）。旧实现一律按止损价成交，行情跳空时每单位亏损被低估。事件推进与尾部回放两处同步；TP 仍按限价成交（真实 TP 为挂单，不加滑点）
+- 回归测试 62 → 67 个；两处旧测试的止损精确断言同步到跳空口径
 
 ## License
 
