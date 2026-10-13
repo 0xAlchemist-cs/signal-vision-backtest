@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-67%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-68%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 
@@ -414,6 +414,16 @@ python -m backtest.voice_event_engine \
 - **P1（无效腿数据依赖）**：逐腿方向过滤**先于** first_fill_ms / TP 参考价 / 风险份额的计算——被剔除的越止损腿不再污染开仓时间与 TP 初始化。旧实现下"无效腿 92 先触发、有效腿 100 后成交、TP 98"会让有效腿在 98 被"止盈"出亏损单；风险份额现重算到有效腿（契约：剔除后重新分配）
 - **P1（voice 跳空止损）**：与主引擎统一——成交 = min/max(现价, 止损) 再加滑点（LONG 取更低价、SHORT 取更高价），SVB_SLIP 同源（默认 0.0005）。旧实现一律按止损价成交，行情跳空时每单位亏损被低估。事件推进与尾部回放两处同步；TP 仍按限价成交（真实 TP 为挂单，不加滑点）
 - 回归测试 62 → 67 个；两处旧测试的止损精确断言同步到跳空口径
+
+## v0.2.11 修复记录（第十轮审计 · 三信号时序）
+
+**因果不变量（最终形态）：任何旧仓的推进/结算永不越过下一个全局事件时刻。**
+
+- **预成交调度器**：新条件单（STOP/LIMIT）撮合出的成交时刻晚于下一个全局事件、且存在旧仓时，不再立即推进/结算旧仓——挂起为**预成交事件**，与开仓信号、孤儿管理消息在统一时间线上按时刻交错执行。到点时若该标的已被更新的信号实际成交取代，则按未成交失效（报告注明"被更新信号取代"）；否则正常撤旧换新
+- 三信号时序测试（先红后绿）：A(10:01 建仓) → B(10:06 SHORT STOP，11:00 才触发) → C(10:11 市价)。旧实现处理 B 时把 A 推进到 11:00，A 在 10:30 的止损被错误执行（真实顺序中 A 应在 10:11 被 C 换新撤旧，永不触及其止损）；B 应被 C 取代而不开仓。修复后三笔全部按真实时间顺序落位
+- 去重登记随调度前移：撮合成功（含预成交挂起）即登记；未撮合信号（STOP 未触发/限价未成交/无有效腿）仍可重复发送重试
+- 本版本为引擎冻结版。后续工作转向生产版同步与真实历史数据逐单 A/B 对照
+- 回归测试 67 → 68 个
 
 ## License
 

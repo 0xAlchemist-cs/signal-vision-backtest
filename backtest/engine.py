@@ -557,7 +557,22 @@ class Sim:
                           + [("orph", o["ts_ms"], o) for o in orphans],
                           key=lambda x: x[1])
 
-        for kind, ev_ts, obj in timeline:
+        # 因果调度 (审计十): 预成交事件与信号/孤儿管理按时间统一交错 —
+        # 任何旧仓的推进/结算永不越过下一个全局事件时刻
+        self._deferred_fills = []
+        deferred = self._deferred_fills
+        i = 0
+        while i < len(timeline) or deferred:
+            t_evt = timeline[i][1] if i < len(timeline) else float("inf")
+            t_def = min(d["fill_ts"] for d in deferred) if deferred else float("inf")
+            if t_def <= t_evt:
+                deferred.sort(key=lambda d: (d["fill_ts"], d["seq"]))
+                payload = deferred.pop(0)
+                self._advance_all(positions, payload["fill_ts"])
+                self._resolve_deferred(payload, positions, last_sig, mg_by_sym)
+                continue
+            kind, ev_ts, obj = timeline[i]
+            i += 1
             if kind == "orph":
                 self._advance_all(positions, ev_ts)
                 if len(positions) == 1:
@@ -568,7 +583,10 @@ class Sim:
                 continue
             sig = obj
             self._advance_all(positions, sig["ts_ms"])
-            self._handle_open(sig, positions, last_sig, mg_by_sym)
+            nxt = timeline[i][1] if i < len(timeline) else float("inf")
+            if deferred:
+                nxt = min(nxt, min(d["fill_ts"] for d in deferred))
+            self._handle_open(sig, positions, last_sig, mg_by_sym, next_event_ms=nxt)
             if len(self.mkt.klines) > 48:
                 active = {p["symbol"] for p in positions.values()}
                 keep_from = sig["ts_ms"] - 35 * 86400 * 1000
@@ -879,7 +897,8 @@ class Sim:
 
     # ---- 开仓 ----
 
-    def _handle_open(self, sig, positions, last_sig, mg_by_sym) -> None:
+    def _handle_open(self, sig, positions, last_sig, mg_by_sym,
+                     next_event_ms=None) -> None:
         base = re.sub(r"USDT$|USDC$", "", str(sig["symbol"]).upper())
         side = str(sig.get("side") or "").upper()
         if side not in ("LONG", "SHORT"):
@@ -1061,6 +1080,49 @@ class Sim:
             legs.append({"entry": fpx, "risk_unit": risk_unit, "risk_share": 1.0 / n,
                          "remain_frac": 1.0, "stop": sl, "t1_done": False,
                          "t2_done": False, "fill_ms": ftms, "exits": []})
+        # 去重登记 (审计十): 信号撮合成功(含预成交挂起)即登记 — 未撮合的信号
+        # (STOP未触发/LIMIT未成交/无有效腿)不登记, 其重复发送仍可重试
+        last_sig[symbol] = (dedup, sig["ts_ms"])
+        # 因果调度 (审计十): 新单成交时刻晚于下一个全局事件且存在旧仓时,
+        # 不得现在推进/结算旧仓 — 那会越过中间事件(如 10:10 的 C)造成历史
+        # 顺序错乱。挂起为预成交, 由 run() 时间线到点执行, 旧仓在等待期间
+        # 仍按真实事件顺序被止损/止盈/替换
+        if base in positions and next_event_ms is not None \
+                and first_fill_ms > next_event_ms:
+            if not hasattr(self, "_deferred_fills"):
+                self._deferred_fills = []
+            self._deferred_fills.append(
+                {"fill_ts": first_fill_ms, "seq": len(self._deferred_fills),
+                 "sig": sig, "legs_spec": legs_spec, "legs": legs, "sl": sl,
+                 "mult": mult, "symbol": symbol, "source": source, "base": base,
+                 "side": side, "msg_ms": msg_ms})
+            self.mkt.prefetch(symbol, source, msg_ms, msg_ms + 6 * 86400 * 1000)
+            return
+        self._create_position({"sig": sig, "legs_spec": legs_spec, "legs": legs,
+                               "sl": sl, "mult": mult, "symbol": symbol,
+                               "source": source, "base": base, "side": side,
+                               "msg_ms": msg_ms, "first_fill_ms": first_fill_ms},
+                              positions, mg_by_sym)
+
+    def _resolve_deferred(self, p, positions, last_sig, mg_by_sym) -> None:
+        # 预成交到点: 等待期间若已被更新的同标的信号取代(对方已实际成交),
+        # 本单按未成交失效; 否则正常撤旧换新建仓
+        cur = positions.get(p["base"])
+        if cur is not None and cur.get("signal_ts_ms", 0) > p["msg_ms"]:
+            self._skip(p["sig"], p["base"], p["side"], "被更新信号取代(未成交)")
+            return
+        self._create_position(p, positions, mg_by_sym)
+
+    def _create_position(self, p, positions, mg_by_sym) -> None:
+        sig = p["sig"]
+        legs_spec = p["legs_spec"]
+        legs = p["legs"]
+        sl = p["sl"]
+        mult = p["mult"]
+        symbol, source, base, side = p["symbol"], p["source"], p["base"], p["side"]
+        msg_ms = p["msg_ms"]
+        first_fill_ms = p["first_fill_ms"]
+        is_long = side == "LONG"
         # 换仓契约 (审查八): replace_on_fill — 新信号**实际成交**后才撤旧换新;
         # 未成交的新信号(STOP未触发/LIMIT未成交/无有效腿)不影响旧仓。
         # 时间因果 (审计九): 先把旧仓**正常推进**到新单首个有效成交时刻 —
@@ -1124,9 +1186,6 @@ class Sim:
                    str(sig.get("stop_timeframe") or ""), 60),
                "force_closed": False}
         positions[base] = pos
-        # 去重登记放在成交确认之后 (审查八): 未成交信号的重复发送可被重试,
-        # 不会被去重表吞掉; 已成交信号的短时重复仍按 DEDUPE_H 忽略
-        last_sig[symbol] = (dedup, sig["ts_ms"])
         self.mkt.prefetch(symbol, source, msg_ms, msg_ms + 6 * 86400 * 1000)
 
     def _skip(self, sig, base, side, reason):
