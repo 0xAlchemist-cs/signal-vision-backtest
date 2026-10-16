@@ -1095,7 +1095,7 @@ class Sim:
                 {"fill_ts": first_fill_ms, "seq": len(self._deferred_fills),
                  "sig": sig, "legs_spec": legs_spec, "legs": legs, "sl": sl,
                  "mult": mult, "symbol": symbol, "source": source, "base": base,
-                 "side": side, "msg_ms": msg_ms})
+                 "side": side, "msg_ms": msg_ms, "first_fill_ms": first_fill_ms})
             self.mkt.prefetch(symbol, source, msg_ms, msg_ms + 6 * 86400 * 1000)
             return
         self._create_position({"sig": sig, "legs_spec": legs_spec, "legs": legs,
