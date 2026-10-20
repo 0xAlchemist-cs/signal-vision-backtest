@@ -1,7 +1,7 @@
 # Signal Vision Backtest — AI 视觉信号解析 + 1m OHLC 事件驱动回测引擎
 
 [![CI](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-68%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-80%20passed-brightgreen)](https://github.com/0xAlchemist-cs/signal-vision-backtest/actions/workflows/ci.yml)
 
 基于 Python 的交易员频道信号研究工具链：把 Discord/Telegram 频道里的**文字 + 图表截图**交给视觉大模型（GLM / Qwen-VL / GPT-4o 等任意 OpenAI 兼容接口）解析成结构化交易指令，再以**可配置的分钟内价格路径假设**(1m OHLC → 0/20/40/59.999s 四 tick)在 1 分钟 K 线上逐条回放，回答一个核心问题——
 

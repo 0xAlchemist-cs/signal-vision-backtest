@@ -1231,11 +1231,14 @@ def phase_prefetch() -> None:
     wins = json.loads((WORK / "kline_windows.json").read_text(encoding="utf-8"))
     mkt = Market()
     for w in wins:
-        # 逐标的解析数据源 (审查十二): 此前硬编码 "bybit", 仅 Binance 有合约的
-        # 标的(如 PUMP)预取静默失败, 只能靠 sim 时 ensure 兜底慢路径补拉
+        # 逐标的解析数据源与规范合约 (审查十二/十三): 此前硬编码 "bybit" 且透传
+        # 窗口原始名 — 仅 Binance 上架的标的(如 PUMP)预取静默失败; 带 1000 前缀
+        # 别名的标的(如 PEPE→1000PEPEUSDT)会按错误合约拉行情。缓存键、API 合约
+        # 与 run() 内部路径必须一致地使用 resolve() 的规范合约
         base = re.sub(r"USDT$|USDC$", "", str(w["symbol"]).upper())
         res = mkt.resolve(base)
-        mkt.prefetch(w["symbol"], res[1] if res else "bybit", w["t0"], w["t1"])
+        mkt.prefetch(res[0] if res else w["symbol"],
+                     res[1] if res else "bybit", w["t0"], w["t1"])
     print(f"[prefetch] {len(wins)} 标的窗口已入队(4 线程后台拉取)")
     deadline = time.time() + 3600 * 4
     while time.time() < deadline:
@@ -1262,11 +1265,14 @@ def phase_sim() -> None:
     (WORK / "funding_quality.json").write_text(json.dumps(
         {"missing_symbols": sorted(sim.funding_missing)}, ensure_ascii=False), encoding="utf-8")
     # 落盘本次 sim 的关键参数 (审查十二): report 常在另一次调用里执行,
-    # 那时环境变量可能已不同 — 报告必须回读 sim 当时的口径而不是现读 env
+    # 那时环境变量可能已不同 — 报告必须回读 sim 当时的口径而不是现读 env。
+    # 审计哈希同样绑定 sim 时的输入快照 (审查十三): report 时现算当前文件哈希,
+    # 会把"输入 A 的逐单收益"与"输入 B 的哈希"并排展示成同一次研究
     (WORK / "sim_meta.json").write_text(json.dumps({
         "rule": rule, "slip": SLIP, "percent_basis": PERCENT_BASIS,
         "risk_usdt": RISK_USDT, "path_mode": PATH_MODE,
-        "position_cap_d": POSITION_CAP_D}, ensure_ascii=False), encoding="utf-8")
+        "position_cap_d": POSITION_CAP_D,
+        "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
 
 
@@ -1310,14 +1316,28 @@ def phase_report() -> None:
     slip = float(meta.get("slip", SLIP))
     risk_usdt = float(meta.get("risk_usdt", RISK_USDT))
     path_mode = meta.get("path_mode", PATH_MODE)
+    cap_d = int(meta.get("position_cap_d", POSITION_CAP_D))
+    # 审计哈希回读 sim 时快照 (审查十三): 输入文件在 sim 之后被修改时必须明示,
+    # 不得静默生成"逐单收益与哈希看似一致"的审计证明
+    saved_hashes = meta.get("input_hashes") or {}
+    cur_hashes = _audit_hashes()
+    drift = [k for k in sorted(set(saved_hashes) | set(cur_hashes))
+             if saved_hashes.get(k) != cur_hashes.get(k)]
+    hash_line = saved_hashes if saved_hashes else cur_hashes
+    drift_warn = (f"- ⚠ 输入变更: sim 之后 {', '.join(drift)} 已被修改, "
+                  f"逐单收益未必对应当前输入; 审计哈希以 sim 时快照为准") if drift else None
+    miss = sorted(fq.get("missing_symbols") or [])
+    cost_note = (f"，部分成本缺失: 资金费未计入 {','.join(miss)}") if miss else ""
     if not closed:
         lines = ["# 影子回测(图解析 + 规则模拟)", "",
                  f"- 信号: {len(trades)}; 成交平仓 0; 持仓中 {len(open_pos)}",
                  f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
-                 f"- 数据质量: 资金费缺失标的 {fq.get('missing_symbols') or '无'}"
-                 f" (路径模式 {path_mode})",
-                 "- 无已平仓交易, 无胜率/ΣR 统计(避免除零)。", "",
-                 f"- 审计哈希: {json.dumps(_audit_hashes(), ensure_ascii=False)}"]
+                 f"- 数据质量: 资金费缺失标的 {miss if miss else '无'}"
+                 f" (路径模式 {path_mode})"]
+        if drift_warn:
+            lines.append(drift_warn)
+        lines += ["- 无已平仓交易, 无胜率/ΣR 统计(避免除零)。", "",
+                  f"- 审计哈希: {json.dumps(hash_line, ensure_ascii=False)}"]
         (WORK / "report_v3.md").write_text("\n".join(lines), encoding="utf-8")
         print("[report] 无已平仓交易, 已输出空报告")
         return
@@ -1329,7 +1349,7 @@ def phase_report() -> None:
         dd = min(dd, cum - peak)
     rule_txt = ("+1R 平40%+保本; +2R 平40%; 剩20%只按喊单"
                 if rule == "r_ladder"
-                else "信号止盈位阶梯, 每档平1/N; 无喊单跟止损; 30天上限")
+                else f"信号止盈位阶梯, 每档平1/N; 无喊单跟止损; {cap_d}天上限")
     lines = ["# 影子回测(图解析 + 规则模拟)", "",
              f"- 信号(文字+图 vision 解析): {len(trades)}; 成交平仓 {len(closed)}; "
              f"持仓中 {len(open_pos)}",
@@ -1338,11 +1358,14 @@ def phase_report() -> None:
              f"市价/止损滑点{slip*100:.2f}%, taker 0.025%/边, 资金费率已计入",
              f"- 胜率 {len(wins)/len(closed)*100:.1f}% | ΣR {total_r:+.2f} | "
              f"均R {total_r/len(closed):+.3f} | 最大回撤 {dd:+.2f}R",
-             f"- 折算({risk_usdt:g}U/单): 毛利 {total_r*risk_usdt:+.0f}U | "
+             f"- 折算({risk_usdt:g}U/单{cost_note}): 毛利 {total_r*risk_usdt:+.0f}U | "
              f"资金费 {total_fund:+.1f}U | 手续费 -{total_fee:.1f}U | "
              f"净额 {total_net:+.0f}U",
-             f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
-             f"- 审计哈希: {json.dumps(_audit_hashes(), ensure_ascii=False)}", "",
+             f"- 数据质量: 资金费缺失标的 {miss if miss else '无'}",
+             f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}"]
+    if drift_warn:
+        lines.append(drift_warn)
+    lines += [f"- 审计哈希: {json.dumps(hash_line, ensure_ascii=False)}", "",
              "| # | 时间 | 标的 | 方向 | 入场 | 止损源 | 出场 | R | 净U |",
              "|---|---|---|---|---|---|---|---|---|"]
     for i, t in enumerate(seq, 1):
