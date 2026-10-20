@@ -80,7 +80,7 @@ SLIP = float(os.getenv("SVB_SLIP", "0.0005"))   # market/stop slippage per side
 # 剩余**的 percent (递进式: 两次 50% = 剩 25%)。显式配置, 不留歧义
 PERCENT_BASIS = os.getenv("SVB_PERCENT_BASIS", "original")   # original|remaining
 ENTRY_TIMEOUT_H = 48
-POSITION_CAP_D = 30
+POSITION_CAP_D = int(os.getenv("SVB_POSITION_CAP_D", "30"))
 DEDUPE_H = 6
 
 
@@ -1231,7 +1231,11 @@ def phase_prefetch() -> None:
     wins = json.loads((WORK / "kline_windows.json").read_text(encoding="utf-8"))
     mkt = Market()
     for w in wins:
-        mkt.prefetch(w["symbol"], "bybit", w["t0"], w["t1"])
+        # 逐标的解析数据源 (审查十二): 此前硬编码 "bybit", 仅 Binance 有合约的
+        # 标的(如 PUMP)预取静默失败, 只能靠 sim 时 ensure 兜底慢路径补拉
+        base = re.sub(r"USDT$|USDC$", "", str(w["symbol"]).upper())
+        res = mkt.resolve(base)
+        mkt.prefetch(w["symbol"], res[1] if res else "bybit", w["t0"], w["t1"])
     print(f"[prefetch] {len(wins)} 标的窗口已入队(4 线程后台拉取)")
     deadline = time.time() + 3600 * 4
     while time.time() < deadline:
@@ -1250,12 +1254,19 @@ def phase_sim() -> None:
     database.init_db()
     signals = load_signals()
     manages = load_manages()
-    sim = Sim(rule=os.getenv("SVB_RULE", "r_ladder"))
+    rule = os.getenv("SVB_RULE", "r_ladder")
+    sim = Sim(rule=rule)
     sim.run(signals, manages)
     (WORK / "trades.json").write_text(json.dumps(sim.trades, ensure_ascii=False),
                                       encoding="utf-8")
     (WORK / "funding_quality.json").write_text(json.dumps(
         {"missing_symbols": sorted(sim.funding_missing)}, ensure_ascii=False), encoding="utf-8")
+    # 落盘本次 sim 的关键参数 (审查十二): report 常在另一次调用里执行,
+    # 那时环境变量可能已不同 — 报告必须回读 sim 当时的口径而不是现读 env
+    (WORK / "sim_meta.json").write_text(json.dumps({
+        "rule": rule, "slip": SLIP, "percent_basis": PERCENT_BASIS,
+        "risk_usdt": RISK_USDT, "path_mode": PATH_MODE,
+        "position_cap_d": POSITION_CAP_D}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
 
 
@@ -1287,12 +1298,24 @@ def phase_report() -> None:
     total_net = sum(t.get("net_usdt", t.get("pnl_usdt", 0)) for t in closed)
     total_fund = sum(t.get("funding_usdt", 0) for t in closed)
     total_fee = sum(t.get("fee_usdt", 0) for t in closed)
+    # 回读 sim 当时的口径 (审查十二): meta 缺失(老运行)时退回环境变量
+    meta = {}
+    meta_path = WORK / "sim_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    rule = meta.get("rule", os.getenv("SVB_RULE", "r_ladder"))
+    slip = float(meta.get("slip", SLIP))
+    risk_usdt = float(meta.get("risk_usdt", RISK_USDT))
+    path_mode = meta.get("path_mode", PATH_MODE)
     if not closed:
         lines = ["# 影子回测(图解析 + 规则模拟)", "",
                  f"- 信号: {len(trades)}; 成交平仓 0; 持仓中 {len(open_pos)}",
                  f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
                  f"- 数据质量: 资金费缺失标的 {fq.get('missing_symbols') or '无'}"
-                 f" (路径模式 {PATH_MODE})",
+                 f" (路径模式 {path_mode})",
                  "- 无已平仓交易, 无胜率/ΣR 统计(避免除零)。", "",
                  f"- 审计哈希: {json.dumps(_audit_hashes(), ensure_ascii=False)}"]
         (WORK / "report_v3.md").write_text("\n".join(lines), encoding="utf-8")
@@ -1305,17 +1328,17 @@ def phase_report() -> None:
         peak = max(peak, cum)
         dd = min(dd, cum - peak)
     rule_txt = ("+1R 平40%+保本; +2R 平40%; 剩20%只按喊单"
-                if os.getenv("SVB_RULE", "r_ladder") == "r_ladder"
+                if rule == "r_ladder"
                 else "信号止盈位阶梯, 每档平1/N; 无喊单跟止损; 30天上限")
     lines = ["# 影子回测(图解析 + 规则模拟)", "",
              f"- 信号(文字+图 vision 解析): {len(trades)}; 成交平仓 {len(closed)}; "
              f"持仓中 {len(open_pos)}",
              f"- 规则: {rule_txt}; 48h 未成交撤",
              f"- 撮合: 1m K线 4 tick(0/20/40/59.999s), 消息按毫秒插入, "
-             f"市价/止损滑点{SLIP*100:.2f}%, taker 0.025%/边, 资金费率已计入",
+             f"市价/止损滑点{slip*100:.2f}%, taker 0.025%/边, 资金费率已计入",
              f"- 胜率 {len(wins)/len(closed)*100:.1f}% | ΣR {total_r:+.2f} | "
              f"均R {total_r/len(closed):+.3f} | 最大回撤 {dd:+.2f}R",
-             f"- 折算(25U/单): 毛利 {total_r*RISK_USDT:+.0f}U | "
+             f"- 折算({risk_usdt:g}U/单): 毛利 {total_r*risk_usdt:+.0f}U | "
              f"资金费 {total_fund:+.1f}U | 手续费 -{total_fee:.1f}U | "
              f"净额 {total_net:+.0f}U",
              f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}",
