@@ -1326,6 +1326,16 @@ def phase_bound() -> None:
             R2_LVL = float(params["r2_lvl"]); R2_FRAC = float(params["r2_frac"])
         except (KeyError, TypeError, ValueError):
             pass
+    # 行情指纹执行时校验 (审查十八): sim 之后 klines1m 被修改/回填 → bound 若照跑,
+    # 会"用新行情计算却签旧行情指纹" — 产物元数据与实际计算条件不一致。
+    # 拒绝执行: 不落盘任何 bound 产物, 提示重跑 sim+bound (旧 bound 仍属于
+    # 数据一致时期的原 sim, 报告对其继续有效)
+    if meta0.get("kline_fp"):
+        cur_fp = _kline_fp()
+        if cur_fp != meta0["kline_fp"]:
+            print("[bound] ⚠ klines1m 与 sim 时不一致(指纹不匹配), 拒绝执行 — "
+                  "行情已被修改/回填, 请重跑 sim + bound 以重建完整链条")
+            return
     rule = params.get("rule") or os.getenv("SVB_RULE", "r_ladder")
     SLIP = SPREAD = FEE_RATE = 0.0
     prev_no_costs = globals()["NO_COSTS"]
