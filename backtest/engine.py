@@ -75,6 +75,10 @@ R2_LVL = float(os.getenv("GR2_LVL", "2.0"))
 R2_FRAC = float(os.getenv("GR2_FRAC", "0.40"))
 FEE_RATE = 0.00025          # taker per side
 SLIP = float(os.getenv("SVB_SLIP", "0.0005"))   # market/stop slippage per side
+# CFD 点差成本 (审查十四, 九频道实战沉淀): 每边按成交名义的 SPREAD 比例计费,
+# 不改成交价(避免方向逻辑散落多处), 费用进 fee_usdt。加密通道默认 0 = 现状;
+# CFD/外汇频道(黄金 0.35USD/边的等价比, 如 0.00008)用它把"成本决定方向"显式化
+SPREAD = float(os.getenv("SVB_SPREAD", "0.0"))
 # 喊单部分止盈的 percent 口径 (审查三): original = 每次平**原始仓位**的 percent
 # (阶梯式: 两次 50% = 全平, 已发布回测报告均用此口径); remaining = 平**当前
 # 剩余**的 percent (递进式: 两次 50% = 剩 25%)。显式配置, 不留歧义
@@ -1203,13 +1207,13 @@ class Sim:
             # 打标记)不收。不看出场时间推断 — 数据截止持仓(出场 ts_ms=None)
             # 曾被误判为未成交而漏收开仓费, 净收益被高估
             if not leg.get("cancelled_before_fill"):
-                fee_usdt += qty * leg["entry"] * FEE_RATE
+                fee_usdt += qty * leg["entry"] * (FEE_RATE + SPREAD)
             for ep in leg["exits"]:
                 move = ((ep["price"] - leg["entry"]) if pos["side"] == "LONG"
                         else (leg["entry"] - ep["price"]))
                 # 出场分数是"腿内占比", 换算到仓位级要乘该腿的风险占比
                 r_total += (move / leg["risk_unit"]) * ep["frac"] * leg["risk_share"]
-                fee_usdt += qty * ep["price"] * ep["frac"] * FEE_RATE
+                fee_usdt += qty * ep["price"] * ep["frac"] * (FEE_RATE + SPREAD)
         pos["r"] = round(r_total, 4)
         pos["pnl_usdt"] = round(r_total * RISK_USDT, 2)
         pos["net_usdt"] = round(pos["pnl_usdt"] + pos.get("funding_usdt", 0.0)
@@ -1271,9 +1275,35 @@ def phase_sim() -> None:
     (WORK / "sim_meta.json").write_text(json.dumps({
         "rule": rule, "slip": SLIP, "percent_basis": PERCENT_BASIS,
         "risk_usdt": RISK_USDT, "path_mode": PATH_MODE,
-        "position_cap_d": POSITION_CAP_D,
+        "position_cap_d": POSITION_CAP_D, "spread": SPREAD,
         "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
+
+
+def phase_bound() -> None:
+    """零成本边界对照 (审查十四): SLIP=0 且 SPREAD=0 重跑一次 sim, 落盘
+    trades_zero_cost.json + bound.json(ΣR 摘要), 报告读取后并列展示。
+    用途: 紧止损/CFD 频道的负结论三重复测协议第 ③ 步的自动化 — 若零成本
+    边界翻正, 结论必须是"1m 粒度不可判定"而非"亏损"。"""
+    global SLIP, SPREAD
+    slip0, spread0 = SLIP, SPREAD
+    SLIP = 0.0
+    SPREAD = 0.0
+    try:
+        signals = load_signals()
+        manages = load_manages()
+        rule = os.getenv("SVB_RULE", "r_ladder")
+        sim = Sim(rule=rule)
+        sim.run(signals, manages)
+        (WORK / "trades_zero_cost.json").write_text(
+            json.dumps(sim.trades, ensure_ascii=False), encoding="utf-8")
+        cl = [t for t in sim.trades if t.get("status") == "closed" and t.get("r") is not None]
+        (WORK / "bound.json").write_text(json.dumps({
+            "n": len(cl), "sum_r": round(sum(t["r"] for t in cl), 4),
+            "rule": rule}, ensure_ascii=False), encoding="utf-8")
+        print(f"[bound] 零成本边界: n={len(cl)} ΣR {sum(t['r'] for t in cl):+.2f}")
+    finally:
+        SLIP, SPREAD = slip0, spread0
 
 
 def _audit_hashes() -> dict:
@@ -1350,19 +1380,54 @@ def phase_report() -> None:
     rule_txt = ("+1R 平40%+保本; +2R 平40%; 剩20%只按喊单"
                 if rule == "r_ladder"
                 else f"信号止盈位阶梯, 每档平1/N; 无喊单跟止损; {cap_d}天上限")
+    # 可测性统计 (审查十四): 止损距离分布决定 1m 四tick口径的可信度 —
+    # 中位 <0.3% 时同bar先SL的保守撮合对结果有系统影响, 必须警示并对照零成本边界
+    dists = sorted(abs(t.get("entry", 0) - t.get("sl_init", t.get("sl", 0))) / t["entry"] * 100
+                   for t in closed if t.get("entry") and t.get("sl", t.get("sl_init")) is not None
+                   and t.get("entry"))
+    if dists:
+        d_med = dists[len(dists) // 2]
+        d_frac = sum(1 for d in dists if d < 0.3) / len(dists) * 100
+    else:
+        d_med = d_frac = None
+    meas_warn = None
+    if d_med is not None and d_med < 0.3:
+        meas_warn = (f"- ⚠ 可测性边界: 止损距离中位 {d_med:.2f}%(<0.3%), "
+                     f"{d_frac:.0f}% 的信号止损在 1m 四tick不可测区间 — "
+                     f"结论应读作'1m 粒度不可判定', 请对照零成本边界")
+    bound = {}
+    bound_path = WORK / "bound.json"
+    if bound_path.exists():
+        try:
+            bound = json.loads(bound_path.read_text(encoding="utf-8"))
+        except Exception:
+            bound = {}
+    spread = float(meta.get("spread", SPREAD))
+    spread_txt = f", CFD点差 {spread*100:.4f}%/边" if spread else ""
     lines = ["# 影子回测(图解析 + 规则模拟)", "",
              f"- 信号(文字+图 vision 解析): {len(trades)}; 成交平仓 {len(closed)}; "
              f"持仓中 {len(open_pos)}",
              f"- 规则: {rule_txt}; 48h 未成交撤",
              f"- 撮合: 1m K线 4 tick(0/20/40/59.999s), 消息按毫秒插入, "
-             f"市价/止损滑点{slip*100:.2f}%, taker 0.025%/边, 资金费率已计入",
+             f"市价/止损滑点{slip*100:.2f}%, taker 0.025%/边{spread_txt}, "
+             f"资金费按可获得数据计入",
              f"- 胜率 {len(wins)/len(closed)*100:.1f}% | ΣR {total_r:+.2f} | "
              f"均R {total_r/len(closed):+.3f} | 最大回撤 {dd:+.2f}R",
              f"- 折算({risk_usdt:g}U/单{cost_note}): 毛利 {total_r*risk_usdt:+.0f}U | "
              f"资金费 {total_fund:+.1f}U | 手续费 -{total_fee:.1f}U | "
              f"净额 {total_net:+.0f}U",
-             f"- 数据质量: 资金费缺失标的 {miss if miss else '无'}",
+             f"- 数据质量: 资金费缺失标的 {miss if miss else '无'}"
+             + (f" | 止损距离中位 {d_med:.2f}%(<0.3%占比 {d_frac:.0f}%)" if d_med is not None else ""),
              f"- 跳过: {json.dumps(skipped, ensure_ascii=False)}"]
+    if meas_warn:
+        lines.append(meas_warn)
+    if bound:
+        flip = (bound.get("sum_r", 0) > 0 >= total_r)
+        bound_line = (f"- 零成本边界: ΣR {bound.get('sum_r', 0):+.2f} "
+                      f"(n={bound.get('n', 0)})")
+        if flip:
+            bound_line += " — 翻正, 结论降级为'1m 粒度不可判定'"
+        lines.append(bound_line)
     if drift_warn:
         lines.append(drift_warn)
     lines += [f"- 审计哈希: {json.dumps(hash_line, ensure_ascii=False)}", "",
@@ -1386,6 +1451,8 @@ def main():
         phase_prefetch()
     elif phase == "sim":
         phase_sim()
+    elif phase == "bound":
+        phase_bound()
     elif phase == "report":
         phase_report()
 

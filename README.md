@@ -86,6 +86,10 @@ python backtest/engine.py report   # renders report_v3.md
 
 Signal JSON contract lives in [`examples/`](examples/) (`signal.json`, `conditional_signal.json`).
 
+### Field findings (9 real channels, 2026-10)
+
+Empirical lessons from a 9-channel shadow-backtest campaign — replicability gap (trader edge lives in fills/runner/sizing, not in posted levels), cost-kills-scalping (3× "edge≈0, cost decides"), half-ledger self-reports (43 fabricated ✅ caught), and the screenable positive pattern (wide stops + low frequency + transparent risk). See [`docs/FIELD_FINDINGS.md`](docs/FIELD_FINDINGS.md). Engine capabilities added from these findings: `SVB_SPREAD` (per-side CFD spread cost), `bound` phase (zero-cost bound with automatic "undecidable" downgrade flag), tight-stop measurability warning in reports.
+
 ### Known limits (read before trusting any number)
 
 1. Intra-bar path is an assumption, not recorded data — for tight-stop (<0.3%) scalpers run pessimistic/optimistic path modes; if the zero-slippage bound flips the sign, the honest conclusion is "undecidable at 1m granularity", not "profitable".
