@@ -71,14 +71,14 @@ def test_rule_change_invalidates_bound(tmp_path, monkeypatch):
         "params": {"rule": "tp_ladder", "slip": 0.0005, "spread": 0.0,
                    "percent_basis": "original", "risk_usdt": 25.0,
                    "path_mode": "synthetic", "position_cap_d": 30},
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     # 旧 bound: 同输入但 rule=r_ladder
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 3, "sum_r": 20.0, "net_sum_r": 20.0, "rule": "r_ladder",
         "params": {"rule": "r_ladder", "slip": 0.0005, "spread": 0.0,
                    "percent_basis": "original", "risk_usdt": 25.0,
                    "path_mode": "synthetic", "position_cap_d": 30},
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "已忽略" in text, "params 指纹不一致的旧 bound 必须被忽略"
@@ -98,10 +98,11 @@ def test_matching_params_bound_accepted(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30, "params": params,
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 3, "sum_r": 20.0, "net_sum_r": 20.0, "rule": "tp_ladder",
-        "params": params, "input_hashes": h}), encoding="utf-8")
+        "params": params, "input_hashes": h, "run_id": "t1", "kline_fp": {}}),
+        encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界: ΣR +20.00" in text
@@ -180,10 +181,11 @@ def test_cost_flip_says_cost_sensitive_not_undecidable(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30, "params": params,
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 1, "sum_r": 6.0, "net_sum_r": 6.0, "rule": "tp_ladder",
-        "params": params, "input_hashes": h}), encoding="utf-8")
+        "params": params, "input_hashes": h, "run_id": "t1", "kline_fp": {}}),
+        encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "成本敏感" in text, "净负+零成本翻正必须明示成本敏感"

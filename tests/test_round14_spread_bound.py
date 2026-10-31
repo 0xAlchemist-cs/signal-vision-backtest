@@ -135,7 +135,9 @@ def test_bound_phase_and_report_line(tmp_path, monkeypatch, capsys):
     (tmp_path / "trades.json").write_text(json.dumps([_TRADE]), encoding="utf-8")
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.002, "percent_basis": "original",
-        "risk_usdt": 25.0, "position_cap_d": 30, "spread": 0.001}), encoding="utf-8")
+        "risk_usdt": 25.0, "position_cap_d": 30, "spread": 0.001,
+        "params": eng._sim_params(), "run_id": "rE", "kline_fp": {}}),
+        encoding="utf-8")
 
     class FakeSim:
         def __init__(self, rule="r_ladder", mkt=None):
@@ -151,16 +153,19 @@ def test_bound_phase_and_report_line(tmp_path, monkeypatch, capsys):
     eng.phase_bound()
     b = json.loads((tmp_path / "bound.json").read_text(encoding="utf-8"))
     assert b["sum_r"] == pytest.approx(1.2)
-    # 报告: 计成本 ΣR=+0.5 正 → 不降级; 绑定哈希须与 sim_meta 一致
+    assert b["run_id"] == "rE", "bound 必须绑定产生它的 sim 的 run_id"
+    # 报告: meta 与 bound 的哈希/参数/run_id 全一致 → 零成本边界行正常展示
     hashes = eng._audit_hashes()
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.002, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30, "spread": 0.001,
-        "input_hashes": hashes}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": hashes,
+        "run_id": "rE", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "trades.json").write_text(json.dumps([_TRADE]), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
-    assert "零成本边界" in text
+    assert "- 零成本边界: ΣR" in text, "绑定完整的 bound 必须被报告采信"
+    assert "已忽略" not in text
     assert "翻正" not in text, "计成本为正时不得触发降级语"
 
 
@@ -180,10 +185,11 @@ def test_bound_flip_flag(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30, "params": params,
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 1, "sum_r": 1.2, "net_sum_r": 1.2, "rule": "tp_ladder",
-        "params": params, "input_hashes": h}), encoding="utf-8")
+        "params": params, "input_hashes": h, "run_id": "t1", "kline_fp": {}}),
+        encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界" in text and "成本敏感" in text

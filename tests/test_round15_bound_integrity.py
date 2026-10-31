@@ -58,10 +58,12 @@ def test_flip_uses_net_r(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30,
-        "params": eng._sim_params(), "input_hashes": eng._audit_hashes()}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": eng._audit_hashes(),
+        "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 1, "sum_r": 6.0, "net_sum_r": 6.0, "rule": "tp_ladder",
-        "params": eng._sim_params(), "input_hashes": eng._audit_hashes()}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": eng._audit_hashes(),
+        "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "成本敏感" in text, \
@@ -196,10 +198,11 @@ def test_matching_bound_still_shown(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30, "params": eng._sim_params(),
-        "input_hashes": h}), encoding="utf-8")
+        "input_hashes": h, "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 5, "sum_r": 12.0, "net_sum_r": 12.0, "rule": "tp_ladder",
-        "params": eng._sim_params(), "input_hashes": h}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": h,
+        "run_id": "t1", "kline_fp": {}}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界: ΣR +12.00" in text

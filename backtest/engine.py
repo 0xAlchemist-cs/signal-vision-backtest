@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1282,6 +1283,8 @@ def phase_sim() -> None:
         "risk_usdt": RISK_USDT, "path_mode": PATH_MODE,
         "position_cap_d": POSITION_CAP_D, "spread": SPREAD,
         "params": _sim_params(),
+        "run_id": uuid.uuid4().hex[:12],
+        "kline_fp": _kline_fp(),
         "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
 
@@ -1292,11 +1295,18 @@ def phase_bound() -> None:
     bound.json 保存 params 指纹 + 输入哈希 (审查十六): 相同输入+不同规则/路径
     等参数的旧 bound 不得为本次结论背书。"""
     global SLIP, SPREAD, FEE_RATE
+    global RISK_USDT, PERCENT_BASIS, PATH_MODE, POSITION_CAP_D
+    global R1_LVL, R1_FRAC, R2_LVL, R2_FRAC
     slip0, spread0, fee0 = SLIP, SPREAD, FEE_RATE
+    saved = dict(SLIP=SLIP, SPREAD=SPREAD, FEE_RATE=FEE_RATE,
+                 RISK_USDT=RISK_USDT, PERCENT_BASIS=PERCENT_BASIS,
+                 PATH_MODE=PATH_MODE, POSITION_CAP_D=POSITION_CAP_D,
+                 R1_LVL=R1_LVL, R1_FRAC=R1_FRAC, R2_LVL=R2_LVL, R2_FRAC=R2_FRAC)
     params = _sim_params()   # 兜底指纹: 无 meta 时取当前环境(清零前抓取)
-    # 参数事实源 = 被对照的那次 sim (审查十六): bound 缺省绑定最近一次 sim_meta
-    # 的参数与规则 — 环境变量与上次 sim 不一致时以 meta 为准, 否则 bound 的指纹
-    # 永远无法与其要对照的报告匹配
+    # 参数事实源 = 被对照的那次 sim (审查十六/十七): bound 缺省绑定最近一次
+    # sim_meta 的参数与规则, 且**按 meta 参数实际执行**(审查十七: 只写旧指纹
+    # 却用当前环境撮合, 是"元数据一致、计算条件不一致"的隐患) — 影响结果的
+    # 全局在恢复后/清零前统一设置
     meta0 = {}
     meta_path0 = WORK / "sim_meta.json"
     if meta_path0.exists():
@@ -1306,6 +1316,16 @@ def phase_bound() -> None:
             meta0 = {}
     if meta0.get("params"):
         params = meta0["params"]
+        try:
+            SLIP = float(params["slip"]); SPREAD = float(params["spread"])
+            RISK_USDT = float(params["risk_usdt"])
+            PERCENT_BASIS = params["percent_basis"]
+            PATH_MODE = params["path_mode"]
+            POSITION_CAP_D = int(params["position_cap_d"])
+            R1_LVL = float(params["r1_lvl"]); R1_FRAC = float(params["r1_frac"])
+            R2_LVL = float(params["r2_lvl"]); R2_FRAC = float(params["r2_frac"])
+        except (KeyError, TypeError, ValueError):
+            pass
     rule = params.get("rule") or os.getenv("SVB_RULE", "r_ladder")
     SLIP = SPREAD = FEE_RATE = 0.0
     prev_no_costs = globals()["NO_COSTS"]
@@ -1325,12 +1345,19 @@ def phase_bound() -> None:
         (WORK / "bound.json").write_text(json.dumps({
             "n": len(cl), "sum_r": sum_r, "net_sum_r": net_sum_r,
             "rule": rule, "slip": slip0, "spread": spread0,
-            "params": params, "input_hashes": _audit_hashes()},
+            "params": params, "input_hashes": _audit_hashes(),
+            "run_id": meta0.get("run_id"), "kline_fp": meta0.get("kline_fp")},
             ensure_ascii=False), encoding="utf-8")
         print(f"[bound] 零成本边界: n={len(cl)} ΣR {sum_r:+.2f} (净 {net_sum_r:+.2f})")
     finally:
         SLIP, SPREAD, FEE_RATE = slip0, spread0, fee0
         globals()["NO_COSTS"] = prev_no_costs
+        RISK_USDT = saved["RISK_USDT"]
+        PERCENT_BASIS = saved["PERCENT_BASIS"]
+        PATH_MODE = saved["PATH_MODE"]
+        POSITION_CAP_D = saved["POSITION_CAP_D"]
+        R1_LVL, R1_FRAC = saved["R1_LVL"], saved["R1_FRAC"]
+        R2_LVL, R2_FRAC = saved["R2_LVL"], saved["R2_FRAC"]
 
 
 def _audit_hashes() -> dict:
@@ -1352,6 +1379,21 @@ def _sim_params() -> dict:
             "path_mode": PATH_MODE, "position_cap_d": POSITION_CAP_D,
             "r1_lvl": R1_LVL, "r1_frac": R1_FRAC,
             "r2_lvl": R2_LVL, "r2_frac": R2_FRAC}
+
+
+def _kline_fp() -> dict:
+    """行情数据版本指纹 (审查十七): klines1m 各文件的大小+mtime — 修数据/重拉
+    缓存后指纹变化, 旧 bound 不得为用新数据重跑的结论背书。"""
+    out = {}
+    kd = WORK / "klines1m"
+    if kd.exists():
+        for f in sorted(kd.glob("*.json")):
+            try:
+                st = f.stat()
+                out[f.name] = f"{st.st_size}-{st.st_mtime_ns}"
+            except OSError:
+                continue
+    return out
 
 
 def phase_report() -> None:
@@ -1455,10 +1497,16 @@ def phase_report() -> None:
             cand = json.loads(bound_path.read_text(encoding="utf-8"))
         except Exception:
             cand = None
-        if cand and cand.get("input_hashes") and meta.get("input_hashes") \
-                and cand.get("params") and meta.get("params") \
-                and cand["input_hashes"] == meta["input_hashes"] \
-                and cand["params"] == meta["params"]:
+        # 三重绑定 (审查十五/十六/十七): 输入哈希 + 参数指纹 + run_id/行情版本 —
+        # 缺一即视为过期产物; run_id/kline_fp 缺失视为无法证明同源, 同样拒绝
+        ok_bind = (cand and cand.get("input_hashes") and meta.get("input_hashes")
+                   and cand.get("params") and meta.get("params")
+                   and cand["input_hashes"] == meta["input_hashes"]
+                   and cand["params"] == meta["params"]
+                   and cand.get("run_id") and meta.get("run_id")
+                   and cand["run_id"] == meta["run_id"]
+                   and (cand.get("kline_fp") or {}) == (meta.get("kline_fp") or {}))
+        if ok_bind:
             bound = cand
         else:
             bound_stale = True
