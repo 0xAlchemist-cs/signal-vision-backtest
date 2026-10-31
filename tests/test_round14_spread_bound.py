@@ -165,23 +165,29 @@ def test_bound_phase_and_report_line(tmp_path, monkeypatch, capsys):
 
 
 def test_bound_flip_flag(tmp_path, monkeypatch):
-    """计成本为负、零成本为正 → 报告必须明示'结论降级'。"""
+    """计成本为负、零成本为正 → 报告必须明示'成本敏感'(宽止损, 隔离可测性行)。"""
     eng = _load("svb_engine_r14f", tmp_path, monkeypatch=monkeypatch)
     _mk_work(tmp_path)
     neg = json.loads(json.dumps(_TRADE))
     neg["r"] = -0.8
     neg["net_usdt"] = -20.0
+    neg["stop_init"] = 97.0          # 3% 宽止损 → 不触发可测性警示
+    neg["legs"] = [{"risk_share": 1.0, "risk_unit": 3.0, "entry": 100.0,
+                    "remain_frac": 0.0, "exits": []}]
     (tmp_path / "trades.json").write_text(json.dumps([neg]), encoding="utf-8")
     h = eng._audit_hashes()
+    params = eng._sim_params()
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
-        "risk_usdt": 25.0, "position_cap_d": 30, "input_hashes": h}), encoding="utf-8")
+        "risk_usdt": 25.0, "position_cap_d": 30, "params": params,
+        "input_hashes": h}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 1, "sum_r": 1.2, "net_sum_r": 1.2, "rule": "tp_ladder",
-        "input_hashes": h}), encoding="utf-8")
+        "params": params, "input_hashes": h}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
-    assert "零成本边界" in text and "翻正" in text and "不可判定" in text
+    assert "零成本边界" in text and "成本敏感" in text
+    assert "不可判定" not in text, "成本敏感与行情可测性是两个结论, 不得混写"
 
 
 def test_funding_wording(tmp_path, monkeypatch):

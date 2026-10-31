@@ -88,7 +88,9 @@ Signal JSON contract lives in [`examples/`](examples/) (`signal.json`, `conditio
 
 ### Field findings (9 real channels, 2026-10)
 
-Empirical lessons from a 9-channel shadow-backtest campaign — replicability gap (trader edge lives in fills/runner/sizing, not in posted levels), cost-kills-scalping (3× "edge≈0, cost decides"), half-ledger self-reports (43 fabricated ✅ caught), and the screenable positive pattern (wide stops + low frequency + transparent risk). See [`docs/FIELD_FINDINGS.md`](docs/FIELD_FINDINGS.md). Engine capabilities added from these findings: `SVB_SPREAD` (per-side CFD spread cost), `bound` phase (zero-cost bound with automatic "undecidable" downgrade flag), tight-stop measurability warning in reports.
+Empirical lessons from a 9-channel shadow-backtest campaign — replicability gap (trader edge lives in fills/runner/sizing, not in posted levels), cost-kills-scalping (3× "edge≈0, cost decides"), half-ledger self-reports (43 fabricated ✅ caught), and the screenable positive pattern (wide stops + low frequency + transparent risk). See [`docs/FIELD_FINDINGS.md`](docs/FIELD_FINDINGS.md). Engine capabilities added from these findings: `SVB_SPREAD` (per-side CFD spread cost), `bound` phase (true zero-cost bound — slippage, spread, taker fee and funding all zeroed — with a "cost-sensitive" flag when costs flip the sign; 1m measurability is assessed separately from stop distances), tight-stop measurability warning in reports.
+
+> **实战发现（九频道战役，2026-10）**：可复制性差额（博主 edge 在成交时点/尾仓/仓位，不在公布价位）、成本绞杀高频风格（三次"毛edge≈0、成本决定"）、半本账自报曲线（43 笔✅捏造被 K 线抓出）、可筛选的正期望形态（宽止损+低频+透明风控）。本轮新增引擎能力：`SVB_SPREAD`（CFD 点差成本）、`bound` 阶段（真·零成本边界：滑点/点差/手续费/资金费全归零；成本翻正只标"成本敏感"，1m 可测性由止损距离单独评估）、报告紧止损可测性警示。
 
 ### Known limits (read before trusting any number)
 

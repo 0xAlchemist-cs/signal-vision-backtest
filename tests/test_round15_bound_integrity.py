@@ -49,7 +49,7 @@ def test_flip_uses_net_r(tmp_path, monkeypatch):
     _mk_work(tmp_path)
     t = {"trader": "t", "symbol": "TESTUSDT", "base": "TEST", "side": "LONG",
          "signal_ts_ms": BASE, "first_fill_ms": BASE,
-         "entry": 100.0, "stop_init": 99.7, "sl_source": "trader",
+         "entry": 100.0, "stop_init": 97.0, "sl_source": "trader",
          "status": "closed", "r": 5.0,            # 毛 +5R
          "pnl_usdt": 125.0, "fee_usdt": 200.0, "funding_usdt": 0.0,
          "net_usdt": -75.0,                        # 净 -3R
@@ -58,14 +58,15 @@ def test_flip_uses_net_r(tmp_path, monkeypatch):
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
         "risk_usdt": 25.0, "position_cap_d": 30,
-        "input_hashes": eng._audit_hashes()}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": eng._audit_hashes()}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 1, "sum_r": 6.0, "net_sum_r": 6.0, "rule": "tp_ladder",
-        "input_hashes": eng._audit_hashes()}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": eng._audit_hashes()}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
-    assert "翻正" in text and "不可判定" in text, \
-        "毛R为正但净R为负+零成本翻正 → 必须给出结论降级明示 (round-14 毛R判断漏报此场景)"
+    assert "成本敏感" in text, \
+        "毛R为正但净R为负+零成本翻正 → 必须明示成本敏感 (round-14 毛R判断漏报此场景)"
+    assert "不可判定" not in text, "成本敏感与行情可测性是两个结论, 不得混写"
 
 
 def test_flip_not_triggered_when_net_positive(tmp_path, monkeypatch):
@@ -181,27 +182,28 @@ def test_stale_bound_ignored_with_warning(tmp_path, monkeypatch):
 
 
 def test_matching_bound_still_shown(tmp_path, monkeypatch):
-    """哈希匹配时 bound 正常展示并参与翻正判断。"""
+    """哈希+参数匹配时 bound 正常展示并参与成本敏感判断。"""
     eng = _load("svb_engine_r15e", tmp_path, monkeypatch)
     _mk_work(tmp_path)
     h = eng._audit_hashes()
     t = {"trader": "t", "symbol": "TESTUSDT", "base": "TEST", "side": "LONG",
          "signal_ts_ms": BASE, "first_fill_ms": BASE,
-         "entry": 100.0, "stop_init": 99.7, "sl_source": "trader",
+         "entry": 100.0, "stop_init": 97.0, "sl_source": "trader",
          "status": "closed", "r": -0.8, "pnl_usdt": -20.0,
          "fee_usdt": 2.0, "funding_usdt": 0.0, "net_usdt": -22.0,
          "legs": [], "exit_parts": []}
     (tmp_path / "trades.json").write_text(json.dumps([t]), encoding="utf-8")
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
-        "risk_usdt": 25.0, "position_cap_d": 30, "input_hashes": h}), encoding="utf-8")
+        "risk_usdt": 25.0, "position_cap_d": 30, "params": eng._sim_params(),
+        "input_hashes": h}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
         "n": 5, "sum_r": 12.0, "net_sum_r": 12.0, "rule": "tp_ladder",
-        "input_hashes": h}), encoding="utf-8")
+        "params": eng._sim_params(), "input_hashes": h}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界: ΣR +12.00" in text
-    assert "翻正" in text and "不可判定" in text
+    assert "成本敏感" in text and "不可判定" not in text
 
 
 # ---------- 4. phase_bound 语义: 真·零成本 ----------

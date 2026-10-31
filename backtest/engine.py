@@ -86,6 +86,9 @@ PERCENT_BASIS = os.getenv("SVB_PERCENT_BASIS", "original")   # original|remainin
 ENTRY_TIMEOUT_H = 48
 POSITION_CAP_D = int(os.getenv("SVB_POSITION_CAP_D", "30"))
 DEDUPE_H = 6
+# 真·零成本模式 (审查十六): phase_bound 期间置 True — 资金费同样停止结算,
+# 使 bound 的净ΣR == 毛ΣR (资金费属于真实成本, 保留它则"零成本"名不副实)
+NO_COSTS = False
 
 
 TICK_OFFSETS = (0, 20_000, 40_000, 59_999)
@@ -697,6 +700,8 @@ class Sim:
                 positions.pop(pos["base"], None)
 
     def _apply_funding(self, pos, rate: float, price: float, tms: int = 0) -> None:
+        if NO_COSTS:
+            return   # 真·零成本模式 (审查十六): 资金费也是成本, 一并归零
         is_long = pos["side"] == "LONG"
         delta = 0.0
         for leg in pos["legs"]:
@@ -1276,23 +1281,38 @@ def phase_sim() -> None:
         "rule": rule, "slip": SLIP, "percent_basis": PERCENT_BASIS,
         "risk_usdt": RISK_USDT, "path_mode": PATH_MODE,
         "position_cap_d": POSITION_CAP_D, "spread": SPREAD,
+        "params": _sim_params(),
         "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
     print(f"[sim] 共 {len(sim.trades)} 条记录")
 
 
 def phase_bound() -> None:
-    """零成本边界对照 (审查十四/十五): SLIP=SPREAD=FEE_RATE=0 重跑一次 sim
-    (真·零成本: 无滑点/无点差/无手续费), 落盘 trades_zero_cost.json + bound.json。
-    bound.json 绑定本次输入哈希与参数 — 报告侧校验不匹配即忽略(审查十五:
-    旧 bound 不得污染新报告)。翻正判断用**净R对净R**(审查十五:
-    毛R为正但成本后为负时, 毛R判断会静默漏报"成本导致结论翻转")。"""
+    """零成本边界对照 (审查十四/十五/十六): SLIP=SPREAD=FEE_RATE=0 且资金费
+    停止结算 (NO_COSTS) — 真·零成本, bound 的净ΣR == 毛ΣR。
+    bound.json 保存 params 指纹 + 输入哈希 (审查十六): 相同输入+不同规则/路径
+    等参数的旧 bound 不得为本次结论背书。"""
     global SLIP, SPREAD, FEE_RATE
     slip0, spread0, fee0 = SLIP, SPREAD, FEE_RATE
+    params = _sim_params()   # 兜底指纹: 无 meta 时取当前环境(清零前抓取)
+    # 参数事实源 = 被对照的那次 sim (审查十六): bound 缺省绑定最近一次 sim_meta
+    # 的参数与规则 — 环境变量与上次 sim 不一致时以 meta 为准, 否则 bound 的指纹
+    # 永远无法与其要对照的报告匹配
+    meta0 = {}
+    meta_path0 = WORK / "sim_meta.json"
+    if meta_path0.exists():
+        try:
+            meta0 = json.loads(meta_path0.read_text(encoding="utf-8"))
+        except Exception:
+            meta0 = {}
+    if meta0.get("params"):
+        params = meta0["params"]
+    rule = params.get("rule") or os.getenv("SVB_RULE", "r_ladder")
     SLIP = SPREAD = FEE_RATE = 0.0
+    prev_no_costs = globals()["NO_COSTS"]
+    globals()["NO_COSTS"] = True
     try:
         signals = load_signals()
         manages = load_manages()
-        rule = os.getenv("SVB_RULE", "r_ladder")
         sim = Sim(rule=rule)
         sim.run(signals, manages)
         (WORK / "trades_zero_cost.json").write_text(
@@ -1305,10 +1325,12 @@ def phase_bound() -> None:
         (WORK / "bound.json").write_text(json.dumps({
             "n": len(cl), "sum_r": sum_r, "net_sum_r": net_sum_r,
             "rule": rule, "slip": slip0, "spread": spread0,
-            "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
+            "params": params, "input_hashes": _audit_hashes()},
+            ensure_ascii=False), encoding="utf-8")
         print(f"[bound] 零成本边界: n={len(cl)} ΣR {sum_r:+.2f} (净 {net_sum_r:+.2f})")
     finally:
         SLIP, SPREAD, FEE_RATE = slip0, spread0, fee0
+        globals()["NO_COSTS"] = prev_no_costs
 
 
 def _audit_hashes() -> dict:
@@ -1319,6 +1341,17 @@ def _audit_hashes() -> dict:
         if p.exists():
             out[name] = _h.sha256(p.read_bytes()).hexdigest()[:16]
     return out
+
+
+def _sim_params() -> dict:
+    """影响结果的全部参数指纹 (审查十六): sim_meta 与 bound.json 都保存同一份,
+    报告逐项核对 — 相同输入+不同规则/路径/风险口径的旧 bound 不得为本次结论背书。"""
+    return {"rule": os.getenv("SVB_RULE", "r_ladder"),
+            "slip": SLIP, "spread": SPREAD,
+            "percent_basis": PERCENT_BASIS, "risk_usdt": RISK_USDT,
+            "path_mode": PATH_MODE, "position_cap_d": POSITION_CAP_D,
+            "r1_lvl": R1_LVL, "r1_frac": R1_FRAC,
+            "r2_lvl": R2_LVL, "r2_frac": R2_FRAC}
 
 
 def phase_report() -> None:
@@ -1411,8 +1444,9 @@ def phase_report() -> None:
     net_sum_r = round(sum(
         t.get("net_usdt", t.get("pnl_usdt", t.get("r", 0.0) * risk_usdt)) / risk_usdt
         for t in closed), 4)
-    # bound 运行绑定 (审查十五): bound.json 与 sim_meta 的输入哈希必须一致,
-    # 任何一侧缺失/不匹配 → 忽略旧边界并告警, 不得让上一次运行的产物污染本报告
+    # bound 运行绑定 (审查十五/十六): bound.json 与 sim_meta 的输入哈希**和参数
+    # 指纹**必须一致 — 相同输入+不同规则/路径/风险口径的旧 bound 同样不得背书。
+    # 任何一侧缺失/不匹配 → 忽略旧边界并告警
     bound = {}
     bound_stale = False
     bound_path = WORK / "bound.json"
@@ -1422,7 +1456,9 @@ def phase_report() -> None:
         except Exception:
             cand = None
         if cand and cand.get("input_hashes") and meta.get("input_hashes") \
-                and cand["input_hashes"] == meta["input_hashes"]:
+                and cand.get("params") and meta.get("params") \
+                and cand["input_hashes"] == meta["input_hashes"] \
+                and cand["params"] == meta["params"]:
             bound = cand
         else:
             bound_stale = True
@@ -1453,11 +1489,16 @@ def phase_report() -> None:
         bound_line = (f"- 零成本边界: ΣR {bound.get('sum_r', 0):+.2f} "
                       f"(净 {b_net:+.2f}, n={bound.get('n', 0)})")
         if flip:
-            bound_line += " — 翻正, 结论降级为'1m 粒度不可判定'"
+            # 措辞拆分 (审查十六): 成本翻正 = 毛优势不足以覆盖交易成本 —
+            # 是成本敏感性结论, 不是行情可测性结论; 1m 可测性由止损距离
+            # 分布单独评估 (meas_warn), 两者不得混同
+            bound_line += (f" — ⚠ 成本敏感: 计成本净ΣR {net_sum_r:+.2f} 为负而零成本"
+                           f"翻正, 毛优势不足以覆盖交易成本, 按当前成本口径结论为负"
+                           f"(行情粒度可测性见止损距离统计, 不随本条翻正)")
         lines.append(bound_line)
     elif bound_stale:
-        lines.append("- ⚠ bound 结果与本次 sim 输入不匹配(或缺少绑定信息), 已忽略 — "
-                     "请重新运行 bound 阶段生成当前输入的零成本边界")
+        lines.append("- ⚠ bound 结果与本次 sim 的输入哈希或参数指纹不匹配, 已忽略 — "
+                     "请重新运行 bound 阶段生成当前输入与参数的零成本边界")
     if drift_warn:
         lines.append(drift_warn)
     lines += [f"- 审计哈希: {json.dumps(hash_line, ensure_ascii=False)}", "",
