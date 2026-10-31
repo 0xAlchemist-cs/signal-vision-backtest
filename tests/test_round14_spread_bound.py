@@ -151,12 +151,17 @@ def test_bound_phase_and_report_line(tmp_path, monkeypatch, capsys):
     eng.phase_bound()
     b = json.loads((tmp_path / "bound.json").read_text(encoding="utf-8"))
     assert b["sum_r"] == pytest.approx(1.2)
-    # 报告: 计成本 ΣR=+0.5 正 → 不降级; 再造负ΣR场景验证翻正明示
+    # 报告: 计成本 ΣR=+0.5 正 → 不降级; 绑定哈希须与 sim_meta 一致
+    hashes = eng._audit_hashes()
+    (tmp_path / "sim_meta.json").write_text(json.dumps({
+        "rule": "tp_ladder", "slip": 0.002, "percent_basis": "original",
+        "risk_usdt": 25.0, "position_cap_d": 30, "spread": 0.001,
+        "input_hashes": hashes}), encoding="utf-8")
     (tmp_path / "trades.json").write_text(json.dumps([_TRADE]), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界" in text
-    assert "翻正" not in text or True  # 计成本为正时不触发降级语
+    assert "翻正" not in text, "计成本为正时不得触发降级语"
 
 
 def test_bound_flip_flag(tmp_path, monkeypatch):
@@ -165,12 +170,15 @@ def test_bound_flip_flag(tmp_path, monkeypatch):
     _mk_work(tmp_path)
     neg = json.loads(json.dumps(_TRADE))
     neg["r"] = -0.8
+    neg["net_usdt"] = -20.0
     (tmp_path / "trades.json").write_text(json.dumps([neg]), encoding="utf-8")
+    h = eng._audit_hashes()
     (tmp_path / "sim_meta.json").write_text(json.dumps({
         "rule": "tp_ladder", "slip": 0.0005, "percent_basis": "original",
-        "risk_usdt": 25.0, "position_cap_d": 30}), encoding="utf-8")
+        "risk_usdt": 25.0, "position_cap_d": 30, "input_hashes": h}), encoding="utf-8")
     (tmp_path / "bound.json").write_text(json.dumps({
-        "n": 1, "sum_r": 1.2, "rule": "tp_ladder"}), encoding="utf-8")
+        "n": 1, "sum_r": 1.2, "net_sum_r": 1.2, "rule": "tp_ladder",
+        "input_hashes": h}), encoding="utf-8")
     eng.phase_report()
     text = (tmp_path / "report_v3.md").read_text(encoding="utf-8")
     assert "零成本边界" in text and "翻正" in text and "不可判定" in text

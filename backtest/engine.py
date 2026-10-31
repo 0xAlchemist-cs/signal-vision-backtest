@@ -1281,14 +1281,14 @@ def phase_sim() -> None:
 
 
 def phase_bound() -> None:
-    """零成本边界对照 (审查十四): SLIP=0 且 SPREAD=0 重跑一次 sim, 落盘
-    trades_zero_cost.json + bound.json(ΣR 摘要), 报告读取后并列展示。
-    用途: 紧止损/CFD 频道的负结论三重复测协议第 ③ 步的自动化 — 若零成本
-    边界翻正, 结论必须是"1m 粒度不可判定"而非"亏损"。"""
-    global SLIP, SPREAD
-    slip0, spread0 = SLIP, SPREAD
-    SLIP = 0.0
-    SPREAD = 0.0
+    """零成本边界对照 (审查十四/十五): SLIP=SPREAD=FEE_RATE=0 重跑一次 sim
+    (真·零成本: 无滑点/无点差/无手续费), 落盘 trades_zero_cost.json + bound.json。
+    bound.json 绑定本次输入哈希与参数 — 报告侧校验不匹配即忽略(审查十五:
+    旧 bound 不得污染新报告)。翻正判断用**净R对净R**(审查十五:
+    毛R为正但成本后为负时, 毛R判断会静默漏报"成本导致结论翻转")。"""
+    global SLIP, SPREAD, FEE_RATE
+    slip0, spread0, fee0 = SLIP, SPREAD, FEE_RATE
+    SLIP = SPREAD = FEE_RATE = 0.0
     try:
         signals = load_signals()
         manages = load_manages()
@@ -1298,12 +1298,17 @@ def phase_bound() -> None:
         (WORK / "trades_zero_cost.json").write_text(
             json.dumps(sim.trades, ensure_ascii=False), encoding="utf-8")
         cl = [t for t in sim.trades if t.get("status") == "closed" and t.get("r") is not None]
+        sum_r = round(sum(t["r"] for t in cl), 4)
+        net_sum_r = round(sum(
+            t.get("net_usdt", t.get("pnl_usdt", t["r"] * RISK_USDT)) / RISK_USDT
+            for t in cl), 4)
         (WORK / "bound.json").write_text(json.dumps({
-            "n": len(cl), "sum_r": round(sum(t["r"] for t in cl), 4),
-            "rule": rule}, ensure_ascii=False), encoding="utf-8")
-        print(f"[bound] 零成本边界: n={len(cl)} ΣR {sum(t['r'] for t in cl):+.2f}")
+            "n": len(cl), "sum_r": sum_r, "net_sum_r": net_sum_r,
+            "rule": rule, "slip": slip0, "spread": spread0,
+            "input_hashes": _audit_hashes()}, ensure_ascii=False), encoding="utf-8")
+        print(f"[bound] 零成本边界: n={len(cl)} ΣR {sum_r:+.2f} (净 {net_sum_r:+.2f})")
     finally:
-        SLIP, SPREAD = slip0, spread0
+        SLIP, SPREAD, FEE_RATE = slip0, spread0, fee0
 
 
 def _audit_hashes() -> dict:
@@ -1380,11 +1385,17 @@ def phase_report() -> None:
     rule_txt = ("+1R 平40%+保本; +2R 平40%; 剩20%只按喊单"
                 if rule == "r_ladder"
                 else f"信号止盈位阶梯, 每档平1/N; 无喊单跟止损; {cap_d}天上限")
-    # 可测性统计 (审查十四): 止损距离分布决定 1m 四tick口径的可信度 —
-    # 中位 <0.3% 时同bar先SL的保守撮合对结果有系统影响, 必须警示并对照零成本边界
-    dists = sorted(abs(t.get("entry", 0) - t.get("sl_init", t.get("sl", 0))) / t["entry"] * 100
-                   for t in closed if t.get("entry") and t.get("sl", t.get("sl_init")) is not None
-                   and t.get("entry"))
+    # 可测性统计 (审查十四/十五): 止损距离分布决定 1m 四tick口径的可信度 —
+    # 中位 <0.3% 时同bar先SL的保守撮合对结果有系统影响, 必须警示并对照零成本边界。
+    # 字段契约 (审查十五): 真实引擎产物是 stop_init — 读 sl_init/sl 是错误字段,
+    # 对真实交易从不触发 (round-14 的测试用假字段 sl 掩盖了这一点)
+    dists = []
+    for t in closed:
+        entry = t.get("entry")
+        stop = t.get("stop_init", t.get("sl", t.get("sl_init")))
+        if entry and stop is not None:
+            dists.append(abs(entry - stop) / entry * 100)
+    dists.sort()
     if dists:
         d_med = dists[len(dists) // 2]
         d_frac = sum(1 for d in dists if d < 0.3) / len(dists) * 100
@@ -1395,13 +1406,26 @@ def phase_report() -> None:
         meas_warn = (f"- ⚠ 可测性边界: 止损距离中位 {d_med:.2f}%(<0.3%), "
                      f"{d_frac:.0f}% 的信号止损在 1m 四tick不可测区间 — "
                      f"结论应读作'1m 粒度不可判定', 请对照零成本边界")
+    # 成本后净ΣR (审查十五): 翻正判断必须净R对净R — 毛ΣR为正但净为负时
+    # (点差/手续费吃掉全部毛优势), 毛R判断会静默漏报"成本导致结论翻转"
+    net_sum_r = round(sum(
+        t.get("net_usdt", t.get("pnl_usdt", t.get("r", 0.0) * risk_usdt)) / risk_usdt
+        for t in closed), 4)
+    # bound 运行绑定 (审查十五): bound.json 与 sim_meta 的输入哈希必须一致,
+    # 任何一侧缺失/不匹配 → 忽略旧边界并告警, 不得让上一次运行的产物污染本报告
     bound = {}
+    bound_stale = False
     bound_path = WORK / "bound.json"
     if bound_path.exists():
         try:
-            bound = json.loads(bound_path.read_text(encoding="utf-8"))
+            cand = json.loads(bound_path.read_text(encoding="utf-8"))
         except Exception:
-            bound = {}
+            cand = None
+        if cand and cand.get("input_hashes") and meta.get("input_hashes") \
+                and cand["input_hashes"] == meta["input_hashes"]:
+            bound = cand
+        else:
+            bound_stale = True
     spread = float(meta.get("spread", SPREAD))
     spread_txt = f", CFD点差 {spread*100:.4f}%/边" if spread else ""
     lines = ["# 影子回测(图解析 + 规则模拟)", "",
@@ -1411,8 +1435,9 @@ def phase_report() -> None:
              f"- 撮合: 1m K线 4 tick(0/20/40/59.999s), 消息按毫秒插入, "
              f"市价/止损滑点{slip*100:.2f}%, taker 0.025%/边{spread_txt}, "
              f"资金费按可获得数据计入",
-             f"- 胜率 {len(wins)/len(closed)*100:.1f}% | ΣR {total_r:+.2f} | "
-             f"均R {total_r/len(closed):+.3f} | 最大回撤 {dd:+.2f}R",
+             f"- 胜率 {len(wins)/len(closed)*100:.1f}% | ΣR(毛) {total_r:+.2f} | "
+             f"ΣR(净) {net_sum_r:+.2f} | 均R {total_r/len(closed):+.3f} | "
+             f"最大回撤 {dd:+.2f}R",
              f"- 折算({risk_usdt:g}U/单{cost_note}): 毛利 {total_r*risk_usdt:+.0f}U | "
              f"资金费 {total_fund:+.1f}U | 手续费 -{total_fee:.1f}U | "
              f"净额 {total_net:+.0f}U",
@@ -1422,12 +1447,17 @@ def phase_report() -> None:
     if meas_warn:
         lines.append(meas_warn)
     if bound:
-        flip = (bound.get("sum_r", 0) > 0 >= total_r)
+        # 净R对净R: 零成本跑里 net_sum_r == sum_r(无任何成本), 此处直接比较
+        b_net = float(bound.get("net_sum_r", bound.get("sum_r", 0)))
+        flip = (b_net > 0 >= net_sum_r)
         bound_line = (f"- 零成本边界: ΣR {bound.get('sum_r', 0):+.2f} "
-                      f"(n={bound.get('n', 0)})")
+                      f"(净 {b_net:+.2f}, n={bound.get('n', 0)})")
         if flip:
             bound_line += " — 翻正, 结论降级为'1m 粒度不可判定'"
         lines.append(bound_line)
+    elif bound_stale:
+        lines.append("- ⚠ bound 结果与本次 sim 输入不匹配(或缺少绑定信息), 已忽略 — "
+                     "请重新运行 bound 阶段生成当前输入的零成本边界")
     if drift_warn:
         lines.append(drift_warn)
     lines += [f"- 审计哈希: {json.dumps(hash_line, ensure_ascii=False)}", "",
